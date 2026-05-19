@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example</groupId>
+  <artifactId>kafka-to-iceberg</artifactId>
+  <!-- Maven CI-friendly version: the real version is supplied by
+       git-semver-release via -Drevision=$(git-semver-release version);
+       0.0.0-SNAPSHOT is only the fallback for plain local builds.
+       https://maven.apache.org/guides/mini/guide-maven-ci-friendly.html -->
+  <version>${revision}</version>
+  <packaging>jar</packaging>
+  <name>Kafka S3 Iceberg Dump</name>
+
+  <properties>
+    <revision>0.0.0-SNAPSHOT</revision>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <flink.version>2.0.2</flink.version>
+    <flink.kafka.connector.version>4.0.1-2.0</flink.kafka.connector.version>
+    <iceberg.version>1.10.2</iceberg.version>
+    <hadoop.version>3.4.1</hadoop.version>
+    <jackson.version>2.18.2</jackson.version>
+  </properties>
+
+  <dependencies>
+    <!-- ===== Flink core: provided by the Flink cluster / image ===== -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-streaming-java</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-clients</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- flink-table-runtime ships in the official Flink image /lib; Iceberg needs RowData -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-table-runtime</artifactId>
+      <version>${flink.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- ===== Bundled into the fat jar ===== -->
+    <dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-connector-kafka</artifactId>
+      <version>${flink.kafka.connector.version}</version>
+    </dependency>
+
+    <!-- Shaded Iceberg-Flink runtime: includes iceberg-core, sink and the
+         org.apache.iceberg.flink.maintenance.api.* table-maintenance API -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-flink-runtime-2.0</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <!-- S3FileIO + shaded AWS SDK v2 (for MinIO / S3) -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws-bundle</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+
+    <!-- Iceberg's CatalogLoader needs org.apache.hadoop.conf.Configuration on the
+         classpath even when using S3FileIO; the shaded Hadoop client uber jars
+         are conflict-free and avoid pulling a full Hadoop tree. -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-api</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-runtime</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
+    <!-- Iceberg JDBC catalog + maintenance JdbcLockFactory talk to Postgres -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>42.7.4</version>
+    </dependency>
+
+    <!-- JSON parsing of the Kafka payload -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>app</finalName>
+    <plugins>
+      <!-- Resolves the CI-friendly ${revision} into the installed/built POM so
+           the artifact is consumable (required on Maven 3 for ci-friendly
+           versions). resolveCiFriendliesOnly = only rewrite ${revision} etc. -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>flatten-maven-plugin</artifactId>
+        <version>1.6.0</version>
+        <configuration>
+          <updatePomFile>true</updatePomFile>
+          <flattenMode>resolveCiFriendliesOnly</flattenMode>
+        </configuration>
+        <executions>
+          <execution>
+            <id>flatten</id>
+            <phase>process-resources</phase>
+            <goals><goal>flatten</goal></goals>
+          </execution>
+          <execution>
+            <id>flatten.clean</id>
+            <phase>clean</phase>
+            <goals><goal>clean</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <!-- Merge service files: required for Iceberg FileIO, AWS,
+                     Hadoop FileSystem and Flink factory discovery -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.example.flinkiceberg.KafkaToIcebergJob</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
