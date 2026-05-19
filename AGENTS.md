@@ -6,7 +6,8 @@ Guidance for AI agents working in this repository.
 
 **Kafka S3 Iceberg Dump** — a demo Apache Flink (Java) app that streams JSON
 events from Kafka into an Apache Iceberg table on S3 (MinIO), with Iceberg
-**table maintenance** (`RewriteDataFiles` + `ExpireSnapshots`) running as a
+**table maintenance** (`RewriteDataFiles` + `ExpireSnapshots` +
+`DeleteOrphanFiles`) running as a
 **separate Flink job** built from the same jar. Two jobs (`kafka-to-iceberg`
 ingest, `iceberg-maintenance`) deployed independently: independent lifecycles,
 failure domains and tuning, shared catalog/lock wiring. The whole stack runs
@@ -51,9 +52,10 @@ docker compose down -v              # tear down incl. volumes
   `IcebergCatalog`; keep it the single source of truth — don't duplicate
   catalog props or `SCHEMA` into the job classes. The split is *logical*: both
   run on the one TaskManager (no isolated memory budget — a second TM/cluster
-  won't fit the 6 GB footprint). Flink's maintenance API has **no orphan-file
-  removal**; that gap is intentional and documented, not a bug to "fix" by
-  swapping engines.
+  won't fit the 6 GB footprint). Maintenance is complete in-process: Iceberg
+  1.10.2's Flink maintenance API includes `DeleteOrphanFiles`, so the job does
+  compaction + expiration + orphan-file removal — don't reintroduce a claim
+  that orphan removal needs another engine (it does not in this version).
 * **Catalog = Iceberg JDBC catalog on Postgres**; the *same* Postgres backs the
   maintenance `JdbcLockFactory` (`IcebergCatalog.lockFactory()`), so the lock
   holds across both separately-deployed jobs. Storage = MinIO via `S3FileIO`
@@ -113,9 +115,10 @@ docker compose down -v              # tear down incl. volumes
 * Java: standard Flink/Iceberg DataStream API; keep operators named
   (`.name(...)`) for readability in the Flink UI.
 * Maintenance tuning knobs live in `IcebergMaintenanceJob` (the
-  `RewriteDataFiles`/`ExpireSnapshots`/`TableMaintenance` builders) — adjust
-  there, not via SQL. Ingest knobs (Kafka source, checkpoint interval) live in
-  `KafkaToIcebergJob`.
+  `RewriteDataFiles`/`ExpireSnapshots`/`DeleteOrphanFiles`/`TableMaintenance`
+  builders) — adjust there, not via SQL. `DeleteOrphanFiles.minAge` must stay
+  comfortably above the ingest commit cadence or in-flight files get deleted.
+  Ingest knobs (Kafka source, checkpoint interval) live in `KafkaToIcebergJob`.
 * Keep README's stack table and version constraints in sync with `pom.xml`.
 * Releases are tagged with
   [git-semver-release](https://github.com/michalstutzmann/git-semver-release)

@@ -2,7 +2,8 @@
 
 A demo Apache Flink (Java) application that **continuously streams JSON events
 from Kafka into an Apache Iceberg table on S3 (MinIO)**, with **Iceberg table
-maintenance** (data-file compaction + snapshot expiration) running as a
+maintenance** (data-file compaction, snapshot expiration and orphan-file
+removal) running as a
 **separate, self-triggering Flink job** built from the same jar, using the
 [Flink table maintenance API](https://iceberg.apache.org/docs/nightly/flink-maintenance/).
 Splitting ingest and maintenance into two jobs gives them independent
@@ -38,20 +39,21 @@ single `docker compose up`.
         │  Flink job 2: iceberg-maintenance   │  warehouse on MinIO (S3)
         │  TableMaintenance (no Kafka source, ▲        │
         │  self-triggers on commit count/age):│        │ reads commits,
-        │    • RewriteDataFiles (compaction)  └────────┘ rewrites/expires
-        │    • ExpireSnapshots  (cleanup)              │
+        │    • RewriteDataFiles  (compaction) └────────┘ rewrites, expires,
+        │    • ExpireSnapshots   (expiry)              │ deletes orphans
+        │    • DeleteOrphanFiles (orphan GC)           │
         └─────────────────────────────────────┘        │
                   catalog + maintenance lock: Postgres (Iceberg JDBC catalog)
 ```
 
 Both jobs are built from one fat jar (`IcebergCatalog` holds the shared
 schema/catalog/lock wiring) and run on the same Flink cluster. The
-Postgres-backed `JdbcLockFactory` is honoured across both jobs, so compaction
-and expiration never collide with ingest commits.
+Postgres-backed `JdbcLockFactory` is honoured across both jobs, so compaction,
+expiration and orphan-file removal never collide with ingest commits.
 
 * **Catalog:** Iceberg **JDBC catalog** on Postgres. The same Postgres also
-  backs the maintenance `JdbcLockFactory`, so compaction and expiration never
-  run concurrently against the table.
+  backs the maintenance `JdbcLockFactory`, so compaction, expiration and
+  orphan-file removal never run concurrently against the table.
 * **Storage:** MinIO via Iceberg `S3FileIO` (path-style, `s3://warehouse`).
 * **Table:** `db.events`, identity-partitioned by `event_type` so the stream
   produces many small files for `RewriteDataFiles` to compact.
@@ -89,7 +91,8 @@ First run downloads images + Maven dependencies, so give it a few minutes.
 **Flink Web UI** — http://localhost:8081
 Two running jobs: `kafka-to-iceberg` (KafkaSource → JSON→RowData →
 IcebergSink) and `iceberg-maintenance` (the `RewriteDataFiles`,
-`ExpireSnapshots`, lock/trigger operators — no Kafka source).
+`ExpireSnapshots`, `DeleteOrphanFiles`, lock/trigger operators — no Kafka
+source).
 
 **MinIO console** — http://localhost:9001 (user `admin`, pass `password`)
 Browse `warehouse/db/events/`:
@@ -98,11 +101,14 @@ Browse `warehouse/db/events/`:
   ≤64 MB files every 3 commits).
 * `metadata/` — new metadata/snapshot files per commit; old snapshots are
   pruned by ExpireSnapshots (keep last 3, max age 5 min).
+* Unreferenced files left behind by rewrite/expire are eventually removed by
+  DeleteOrphanFiles (only files older than its 10 min `minAge` are eligible,
+  so deletions lag well behind ingest — this is the safety margin, not a bug).
 
 **Maintenance logs**
 
 ```bash
-docker compose logs -f flink-taskmanager | grep -Ei "rewrite|expire|maintenance"
+docker compose logs -f flink-taskmanager | grep -Ei "rewrite|expire|orphan|maintenance"
 ```
 
 **Catalog & lock in Postgres**
@@ -127,6 +133,7 @@ Maintenance behaviour is set in
 
 * `RewriteDataFiles.scheduleOnCommitCount(3)` / `targetFileSizeBytes(64MB)`
 * `ExpireSnapshots.scheduleOnCommitCount(5)` / `maxSnapshotAge(5 min)` / `retainLast(3)`
+* `DeleteOrphanFiles.scheduleOnCommitCount(10)` / `minAge(10 min)` / `usePrefixListing(true)`
 * `TableMaintenance.rateLimit(1 min)` / `lockCheckDelay(10 s)`
 
 Ingest behaviour (Kafka source, checkpoint interval) is in
@@ -218,9 +225,10 @@ emitted as `target/app.jar` regardless of version.
   split (independent job lifecycles + failure domains, independently tunable
   cadence) — it does **not** give maintenance an isolated memory budget. True
   resource isolation would need a second TaskManager/cluster, which the lean
-  6 GB demo footprint does not have room for. Note also that Flink's
-  maintenance API does not do orphan-file removal — a known gap for a
-  Flink-only stack.
+  6 GB demo footprint does not have room for. (Maintenance itself is complete:
+  Iceberg 1.10.2's Flink maintenance API does include `DeleteOrphanFiles`, so
+  the job runs compaction + expiration + orphan-file removal in-process — no
+  external engine needed.)
 * Iceberg's `CatalogLoader` requires `org.apache.hadoop.conf.Configuration` on
   the classpath even with `S3FileIO`; the shaded `hadoop-client-api/runtime`
   uber jars are bundled to satisfy that without dragging in a full Hadoop tree.

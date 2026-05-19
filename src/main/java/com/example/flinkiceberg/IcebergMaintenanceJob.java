@@ -5,6 +5,7 @@ import java.time.Duration;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.maintenance.api.DeleteOrphanFiles;
 import org.apache.iceberg.flink.maintenance.api.ExpireSnapshots;
 import org.apache.iceberg.flink.maintenance.api.RewriteDataFiles;
 import org.apache.iceberg.flink.maintenance.api.TableMaintenance;
@@ -13,18 +14,17 @@ import org.apache.iceberg.flink.maintenance.api.TriggerLockFactory;
 /**
  * Maintenance job: a standalone, long-running Flink job whose entire graph is
  * Iceberg {@link TableMaintenance}. It has no Kafka source — it watches the
- * table's commit history and self-triggers data-file compaction and snapshot
- * expiration on the configured cadence (commit count / age), so no external
- * scheduler is needed.
+ * table's commit history and self-triggers the full set of maintenance tasks
+ * on the configured cadence (commit count / age), so no external scheduler is
+ * needed: data-file compaction ({@link RewriteDataFiles}), snapshot expiration
+ * ({@link ExpireSnapshots}) and orphan-file removal
+ * ({@link DeleteOrphanFiles}).
  *
  * <p>Deployed separately from {@link KafkaToIcebergJob} so maintenance and
  * ingest have independent lifecycles, failure domains and resource budgets.
  * Concurrent commits against the table are made safe by the Postgres-backed
  * {@link TriggerLockFactory} from {@link IcebergCatalog} — the same lock store
  * the ingest job's catalog uses, so the lock holds across both jobs.
- *
- * <p>Note: Flink's maintenance API covers compaction and snapshot expiration
- * but not orphan-file removal; that remains a known gap for a Flink-only stack.
  */
 public final class IcebergMaintenanceJob {
 
@@ -63,6 +63,17 @@ public final class IcebergMaintenanceJob {
                 .scheduleOnCommitCount(5)
                 .maxSnapshotAge(Duration.ofMinutes(5))
                 .retainLast(3)
+                .deleteBatchSize(100))
+        .add(
+            // Least urgent and most expensive (it lists the whole table
+            // prefix), so it runs least often. minAge is kept well above the
+            // ingest commit cadence so files from an in-flight commit are
+            // never mistaken for orphans; usePrefixListing uses S3-style
+            // object listing, which is correct for the S3FileIO/MinIO store.
+            DeleteOrphanFiles.builder()
+                .scheduleOnCommitCount(10)
+                .minAge(Duration.ofMinutes(10))
+                .usePrefixListing(true)
                 .deleteBatchSize(100))
         .append();
 
