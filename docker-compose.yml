@@ -1,10 +1,12 @@
-# Self-contained demo stack: Kafka -> Flink -> Iceberg (on MinIO/S3),
-# with Iceberg table maintenance running inside the same Flink job.
+# Self-contained demo stack: Kafka -> Flink -> Iceberg (on MinIO/S3).
+# Ingest and Iceberg table maintenance run as two separate Flink jobs from
+# the same fat jar (independent lifecycles + failure domains).
 #
 #   docker compose up --build
 #
 # The `builder` service compiles the fat jar (no local JDK/Maven needed),
-# `submitter` deploys it to the Flink cluster, and `datagen` streams events.
+# `submitter` deploys both jobs to the Flink cluster, and `datagen` streams
+# events.
 
 name: s3-table-dump
 
@@ -112,6 +114,12 @@ services:
         parallelism.default: 1
         execution.checkpointing.interval: 30s
         state.backend.type: hashmap
+        # Bounded recovery: any residual transient (e.g. a JDBC cold-connect
+        # blip) recovers fast instead of relying on cluster defaults, and a
+        # genuinely broken job fails fast instead of looping forever.
+        restart-strategy.type: fixed-delay
+        restart-strategy.fixed-delay.attempts: 3
+        restart-strategy.fixed-delay.delay: 5 s
 
   flink-taskmanager:
     image: flink:2.0.2-java21
@@ -159,12 +167,21 @@ services:
       AWS_REGION: us-east-1
     volumes:
       - job:/jars:ro
+    # Two jobs from one jar: the ingest job uses the jar's manifest main class
+    # (KafkaToIcebergJob); the maintenance job overrides it with -c. ensureTable()
+    # is idempotent so order isn't required for correctness, but submitting
+    # maintenance only once ingest is RUNNING avoids two jobs deploying onto the
+    # single TaskManager at the same instant (the JDBC cold-connect race).
     entrypoint: >
       /bin/bash -c "
       echo 'waiting for Flink JobManager REST...';
       until (echo > /dev/tcp/flink-jobmanager/8081) 2>/dev/null; do sleep 3; done;
-      echo 'submitting job';
-      flink run -d -m flink-jobmanager:8081 /jars/app.jar"
+      echo 'submitting ingest job';
+      flink run -d -m flink-jobmanager:8081 /jars/app.jar;
+      echo 'waiting for ingest job to be RUNNING...';
+      until flink list -r -m flink-jobmanager:8081 2>/dev/null | grep -q 'kafka-to-iceberg'; do sleep 3; done;
+      echo 'submitting maintenance job';
+      flink run -d -m flink-jobmanager:8081 -c com.example.flinkiceberg.IcebergMaintenanceJob /jars/app.jar"
 
   # ----------------------------------------------------------- data source ---
   datagen:

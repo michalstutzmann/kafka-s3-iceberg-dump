@@ -1,10 +1,12 @@
 # Kafka S3 Iceberg Dump
 
 A demo Apache Flink (Java) application that **continuously streams JSON events
-from Kafka into an Apache Iceberg table on S3 (MinIO)**, while running
-**Iceberg table maintenance** (data-file compaction + snapshot expiration)
-*inside the same Flink job* using the
+from Kafka into an Apache Iceberg table on S3 (MinIO)**, with **Iceberg table
+maintenance** (data-file compaction + snapshot expiration) running as a
+**separate, self-triggering Flink job** built from the same jar, using the
 [Flink table maintenance API](https://iceberg.apache.org/docs/nightly/flink-maintenance/).
+Splitting ingest and maintenance into two jobs gives them independent
+lifecycles, failure domains and tuning.
 
 The whole thing — build, cluster, storage and a data generator — runs with a
 single `docker compose up`.
@@ -27,16 +29,25 @@ single `docker compose up`.
  datagen ──JSON──▶ Kafka topic "events"
                         │
                         ▼
-        ┌──────────────────────────────────────┐
-        │            Flink job                  │
+        ┌─────────────────────────────────────┐
+        │  Flink job 1: kafka-to-iceberg      │
         │  KafkaSource ─▶ JSON→RowData ─▶ IcebergSink ─┐
-        │                                              │ commits
-        │  TableMaintenance (same StreamEnv):          ▼
-        │    • RewriteDataFiles  (compaction)   Iceberg table db.events
-        │    • ExpireSnapshots   (cleanup)      warehouse on MinIO (S3)
-        └──────────────────────────────────────┘
-                  catalog + lock: Postgres (Iceberg JDBC catalog)
+        └─────────────────────────────────────┘        │ commits
+                                                        ▼
+        ┌─────────────────────────────────────┐  Iceberg table db.events
+        │  Flink job 2: iceberg-maintenance   │  warehouse on MinIO (S3)
+        │  TableMaintenance (no Kafka source, ▲        │
+        │  self-triggers on commit count/age):│        │ reads commits,
+        │    • RewriteDataFiles (compaction)  └────────┘ rewrites/expires
+        │    • ExpireSnapshots  (cleanup)              │
+        └─────────────────────────────────────┘        │
+                  catalog + maintenance lock: Postgres (Iceberg JDBC catalog)
 ```
+
+Both jobs are built from one fat jar (`IcebergCatalog` holds the shared
+schema/catalog/lock wiring) and run on the same Flink cluster. The
+Postgres-backed `JdbcLockFactory` is honoured across both jobs, so compaction
+and expiration never collide with ingest commits.
 
 * **Catalog:** Iceberg **JDBC catalog** on Postgres. The same Postgres also
   backs the maintenance `JdbcLockFactory`, so compaction and expiration never
@@ -67,7 +78,8 @@ That will, in order:
 3. `postgres` — Iceberg JDBC catalog + maintenance lock store.
 4. `kafka` / `kafka-setup` — start the broker and create the `events` topic.
 5. `flink-jobmanager` / `flink-taskmanager` — start the Flink 2.0 cluster.
-6. `submitter` — submit the job to the cluster.
+6. `submitter` — submit both jobs (`kafka-to-iceberg`, then
+   `iceberg-maintenance`) to the cluster.
 7. `datagen` — stream synthetic JSON events into Kafka.
 
 First run downloads images + Maven dependencies, so give it a few minutes.
@@ -75,9 +87,9 @@ First run downloads images + Maven dependencies, so give it a few minutes.
 ## Verify it works
 
 **Flink Web UI** — http://localhost:8081
-The running `kafka-to-iceberg` job shows two pipelines: the Kafka→Iceberg
-ingest, and the Iceberg maintenance operators (`RewriteDataFiles`,
-`ExpireSnapshots`, the lock/trigger operators).
+Two running jobs: `kafka-to-iceberg` (KafkaSource → JSON→RowData →
+IcebergSink) and `iceberg-maintenance` (the `RewriteDataFiles`,
+`ExpireSnapshots`, lock/trigger operators — no Kafka source).
 
 **MinIO console** — http://localhost:9001 (user `admin`, pass `password`)
 Browse `warehouse/db/events/`:
@@ -110,22 +122,29 @@ docker compose exec kafka \
 
 ## Tuning
 
-Maintenance/ingest behaviour is set in
-[`KafkaToIcebergJob.java`](src/main/java/com/example/flinkiceberg/KafkaToIcebergJob.java):
+Maintenance behaviour is set in
+[`IcebergMaintenanceJob.java`](src/main/java/com/example/flinkiceberg/IcebergMaintenanceJob.java):
 
 * `RewriteDataFiles.scheduleOnCommitCount(3)` / `targetFileSizeBytes(64MB)`
 * `ExpireSnapshots.scheduleOnCommitCount(5)` / `maxSnapshotAge(5 min)` / `retainLast(3)`
 * `TableMaintenance.rateLimit(1 min)` / `lockCheckDelay(10 s)`
 
-The job reads all connection settings from environment variables
+Ingest behaviour (Kafka source, checkpoint interval) is in
+[`KafkaToIcebergJob.java`](src/main/java/com/example/flinkiceberg/KafkaToIcebergJob.java).
+Both jobs read all connection settings from environment variables
 (`KAFKA_BOOTSTRAP`, `ICEBERG_JDBC_URI`, `S3_ENDPOINT`, …) with
-container-friendly defaults — see the top of `main()`.
+container-friendly defaults — see
+[`IcebergCatalog.fromEnv()`](src/main/java/com/example/flinkiceberg/IcebergCatalog.java).
 
 ## Build / run locally (without Docker)
 
 ```bash
 ./mvnw -DskipTests package          # produces target/app.jar (0.0.0-SNAPSHOT)
-flink run target/app.jar            # against any Flink 2.0 cluster
+
+# ingest job (jar manifest main class):
+flink run target/app.jar
+# maintenance job (override the main class):
+flink run -c com.example.flinkiceberg.IcebergMaintenanceJob target/app.jar
 ```
 
 To stamp a real version, pass `-Drevision` from git-semver-release — see
@@ -190,11 +209,38 @@ emitted as `target/app.jar` regardless of version.
   used at all — the `minio-setup` job creates the bucket with a plain `mkdir`
   on the data volume (in MinIO's single-drive backend a top-level directory
   *is* a bucket), reusing `alpine/minio`'s own shell.
-* The Flink **client** (the `submitter` container) executes `main()` up to
-  `env.execute()`, so it creates the namespace/table and therefore needs
-  network access to Postgres and MinIO — `depends_on` handles ordering.
+* The Flink **client** (the `submitter` container) executes each job's
+  `main()` up to `env.execute()`, so `IcebergCatalog.ensureTable()` runs there
+  and needs network access to Postgres and MinIO — `depends_on` handles
+  ordering. `ensureTable()` is idempotent and race-tolerant, so the ingest and
+  maintenance jobs can be submitted in either order.
+* Both jobs run on the **same single TaskManager**, so this is a *logical*
+  split (independent job lifecycles + failure domains, independently tunable
+  cadence) — it does **not** give maintenance an isolated memory budget. True
+  resource isolation would need a second TaskManager/cluster, which the lean
+  6 GB demo footprint does not have room for. Note also that Flink's
+  maintenance API does not do orphan-file removal — a known gap for a
+  Flink-only stack.
 * Iceberg's `CatalogLoader` requires `org.apache.hadoop.conf.Configuration` on
   the classpath even with `S3FileIO`; the shaded `hadoop-client-api/runtime`
   uber jars are bundled to satisfy that without dragging in a full Hadoop tree.
-* Re-running `submitter` submits another job copy; for a clean restart use
-  `docker compose down -v` then `docker compose up --build`.
+* The `iceberg-maintenance` job's `JdbcLockFactory.open()` (run on the
+  *TaskManager* operator) could lose a cold-connect race to Postgres on first
+  deploy (`UncheckedSQLException: Failed to connect`), costing one startup
+  restart. Defence in depth, in order of who actually fixes it:
+  1. **`RetryingTriggerLockFactory`** (the real fix) wraps the lock factory and
+     retries `open()` *in-place on the TaskManager* (5 × 3 s), absorbing the
+     transient with no job restart. A client-side pre-flight can't do this —
+     the failing connection is made on the TM, not the submitter.
+  2. **`IcebergCatalog.awaitJdbc()`** is a *fail-fast* pre-flight in the
+     submitter: if Postgres is genuinely down it errors clearly before any job
+     is created (it does not prevent the TM race).
+  3. **`restart-strategy.type: fixed-delay`** (3 attempts, 5 s) is the bounded
+     last resort, so anything still unhandled recovers fast / fails fast
+     instead of looping forever.
+
+  Expected steady state: **`numRestarts=0`** for both jobs and an empty
+  exception history. A *growing* exception history or a restart loop is the
+  real signal something is wrong.
+* Re-running `submitter` submits another copy of *both* jobs; for a clean
+  restart use `docker compose down -v` then `docker compose up --build`.
