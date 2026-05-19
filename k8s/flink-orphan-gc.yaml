@@ -1,18 +1,12 @@
-# Maintenance job as its OWN Flink Application-Mode cluster (separate
-# JobManager + TaskManager pods from the ingest cluster). Independent memory
-# budget + failure domain — closing the "logical split only" limitation of
-# the single session cluster.
-#
-# Runs RewriteDataFiles + ExpireSnapshots. Orphan-file removal lives in its
-# own cluster (`orphan-gc`) which shares the SAME Postgres maintenance lock id
-# (db.events) — that lock serialises the two maintenance graphs against each
-# other. Ingest writes don't use this lock; they rely on Iceberg's normal
-# optimistic commit protocol. RetryingTriggerLockFactory still absorbs the
-# JDBC cold-connect race in-place on the TaskManager.
+# Orphan-file GC as its OWN Flink Application-Mode cluster (own JM+TM pods).
+# Runs only DeleteOrphanFiles. It uses the SAME Postgres maintenance lock id
+# (db.events) as the rewrite/expire `maintenance` cluster, so the lock factory
+# serialises orphan GC against ExpireSnapshots' deletes — fixing the S3-404
+# race without giving up isolation.
 apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:
-  name: maintenance
+  name: orphan-gc
   namespace: s3-table-dump
 spec:
   image: s3-table-dump:dev
@@ -23,10 +17,6 @@ spec:
     taskmanager.numberOfTaskSlots: "1"
     state.backend.type: hashmap
     execution.checkpointing.interval: "30s"
-    # Force the PostgreSQL driver to load from Flink's parent (system)
-    # classloader — where /opt/flink/lib + java.sql.DriverManager live — so
-    # the JDBC catalog never hits a child-first driver-registration race
-    # ("No suitable driver found") on the JM SourceCoordinator at startup.
     classloader.parent-first-patterns.additional: "org.postgresql."
     restart-strategy.type: fixed-delay
     restart-strategy.fixed-delay.attempts: "3"
@@ -53,7 +43,7 @@ spec:
   taskManager:
     resource:
       memory: "768m"
-      cpu: 0.5
+      cpu: 0.25
   podTemplate:
     spec:
       containers:
@@ -62,6 +52,6 @@ spec:
             - { name: S3_REGION, value: "us-east-1" }
   job:
     jarURI: local:///opt/flink/usrlib/app.jar
-    entryClass: com.example.flinkiceberg.IcebergMaintenanceJob
+    entryClass: com.example.flinkiceberg.IcebergOrphanGcJob
     parallelism: 1
     upgradeMode: stateless

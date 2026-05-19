@@ -41,8 +41,11 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 10
             failureThreshold: 30
+          # request kept below the limit so three Flink clusters + infra can
+          # still be scheduled on the tight single-node minikube; Kafka grows
+          # into the 1536Mi limit at runtime.
           resources:
-            requests: { memory: "1Gi", cpu: "250m" }
+            requests: { memory: "768Mi", cpu: "250m" }
             limits: { memory: "1536Mi" }
 ---
 apiVersion: v1

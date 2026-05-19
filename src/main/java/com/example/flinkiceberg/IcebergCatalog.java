@@ -32,7 +32,7 @@ import org.apache.iceberg.types.Types;
  * <p>The two jobs are deployed separately so ingest and maintenance have
  * independent lifecycles and failure domains; this class keeps the parts they
  * must agree on — schema, env-driven catalog config, and the Postgres-backed
- * maintenance lock — in one place.
+ * maintenance lock wiring — in one place.
  *
  * <p>All settings are environment-driven so the same jar runs locally and in
  * the Docker Compose stack.
@@ -217,10 +217,11 @@ final class IcebergCatalog {
   }
 
   /**
-   * Lock shared by maintenance tasks (and any other writer) so compaction and
-   * snapshot expiration never collide. It is backed by the *same* Postgres as
-   * the JDBC catalog, so the lock is honoured across the separately-deployed
-   * ingest and maintenance jobs. JdbcLockFactory auto-creates its lock table.
+   * Lock used by the maintenance graph so compaction, snapshot expiration and
+   * orphan cleanup coordinate their triggers. It is backed by the *same*
+   * Postgres as the JDBC catalog. Ingest writes do not use this lock; they rely
+   * on Iceberg's normal optimistic commit protocol. JdbcLockFactory
+   * auto-creates its lock table.
    *
    * <p>Wrapped in {@link RetryingTriggerLockFactory}: {@code open()} runs on
    * the TaskManager operator and its first JDBC connection can lose a

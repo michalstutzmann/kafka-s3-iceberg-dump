@@ -4,7 +4,7 @@
 # CPU budgets and fully independent failure domains.
 #
 # Service names (kafka/postgres/minio) match IcebergCatalog.fromEnv() and
-# KafkaToIcebergJob defaults, so only AWS_REGION needs to be set explicitly.
+# KafkaToIcebergJob defaults, so only S3_REGION needs to be set explicitly.
 apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:
@@ -29,20 +29,35 @@ spec:
     restart-strategy.type: fixed-delay
     restart-strategy.fixed-delay.attempts: "3"
     restart-strategy.fixed-delay.delay: "5 s"
+    # Tiny demo jobs (parallelism 1, hashmap state): shrink Flink's memory
+    # components so a small JM/TM is a VALID layout and three isolated
+    # clusters fit the node. Defaults (metaspace 256m, overhead min 192m,
+    # network min 64m, managed 0.4) overflow a 512m JM / 768m TM.
+    jobmanager.memory.jvm-metaspace.size: "128m"
+    jobmanager.memory.off-heap.size: "64m"
+    jobmanager.memory.jvm-overhead.min: "32m"
+    jobmanager.memory.jvm-overhead.max: "64m"
+    taskmanager.memory.jvm-metaspace.size: "128m"
+    taskmanager.memory.jvm-overhead.min: "32m"
+    taskmanager.memory.jvm-overhead.max: "64m"
+    taskmanager.memory.framework.off-heap.size: "64m"
+    taskmanager.memory.network.min: "16m"
+    taskmanager.memory.network.max: "32m"
+    taskmanager.memory.managed.size: "0"
   jobManager:
     resource:
-      memory: "768m"
+      memory: "512m"
       cpu: 0.25
   taskManager:
     resource:
-      memory: "1280m"
+      memory: "768m"
       cpu: 0.5
   podTemplate:
     spec:
       containers:
         - name: flink-main-container
           env:
-            - { name: AWS_REGION, value: "us-east-1" }
+            - { name: S3_REGION, value: "us-east-1" }
   job:
     jarURI: local:///opt/flink/usrlib/app.jar
     entryClass: com.example.flinkiceberg.KafkaToIcebergJob

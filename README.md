@@ -6,11 +6,14 @@ maintenance** (data-file compaction, snapshot expiration and orphan-file
 removal) running as a **separate, self-triggering Flink job**, using the
 [Flink table maintenance API](https://iceberg.apache.org/docs/nightly/flink-maintenance/).
 
-Ingest and maintenance are deployed as **two independent Flink Application-Mode
-clusters** (via the Flink Kubernetes Operator) — each its own JobManager +
-TaskManager. That gives them independent lifecycles, failure domains **and
-isolated memory/CPU budgets** (the reason for moving off a single shared
-session cluster).
+It is deployed as **three independent Flink Application-Mode clusters** (via
+the Flink Kubernetes Operator) — `ingest`, `maintenance` (rewrite + expire)
+and `orphan-gc` (orphan-file removal) — each its own JobManager + TaskManager.
+That gives them independent lifecycles, failure domains **and isolated
+memory/CPU budgets**. Orphan GC is split out and shares the *same* Postgres
+maintenance lock as `maintenance`, so the lock serialises it against
+`ExpireSnapshots` (which deletes files) — fixing the S3-404 race without
+giving up isolation.
 
 The whole thing — image build, operator, storage and a data generator — comes
 up on **minikube** with a single `scripts/minikube-up.sh`.
@@ -24,7 +27,7 @@ up on **minikube** with a single `scripts/minikube-up.sh`.
 | flink-connector-kafka | 4.0.1-2.0 | externalized Kafka connector for Flink 2.0 |
 | Apache Iceberg | 1.10.2 | `iceberg-flink-runtime-2.0` + `iceberg-aws-bundle` |
 | Apache Kafka | 4.0.0 | KRaft mode (no ZooKeeper) |
-| Flink Kubernetes Operator | 1.14.0 | manages the two Application-Mode clusters |
+| Flink Kubernetes Operator | 1.14.0 | manages the three Application-Mode clusters |
 | Maven | 3.9.9 | runs in the Docker build stage; no local JDK/Maven needed |
 | MinIO / Postgres | alpine/minio RELEASE.2025-10-15 / pg 17.10 | S3 storage / Iceberg JDBC catalog + maintenance lock |
 | minikube / kubectl / helm | any recent | local Kubernetes + deploy tooling |
@@ -36,31 +39,36 @@ up on **minikube** with a single `scripts/minikube-up.sh`.
                         │
                         ▼
   ┌────────────────────────────────────┐
-  │  Flink Application cluster: ingest  │   own JobManager + TaskManager pods
+  │  cluster: ingest   (own JM+TM pods) │
   │  KafkaSource ▶ JSON→RowData ▶ IcebergSink ─┐
   └────────────────────────────────────┘       │ commits
                                                 ▼
   ┌────────────────────────────────────┐  Iceberg table db.events
-  │  Flink Application cluster:         │  warehouse on MinIO (S3)
-  │  maintenance   (own JM + TM pods)   ▲        │
-  │  TableMaintenance, self-triggering: │        │ reads commits,
-  │    • RewriteDataFiles  (compaction) └────────┘ rewrites, expires,
-  │    • ExpireSnapshots   (expiry)              │ deletes orphans
-  │    • DeleteOrphanFiles (orphan GC)           │
+  │  cluster: maintenance (own JM+TM)   │  warehouse on MinIO (S3)
+  │  TableMaintenance, self-triggering: ▲        │
+  │    • RewriteDataFiles (compaction)  └────────┘ rewrites / expires
+  │    • ExpireSnapshots  (expiry)               │
   └────────────────────────────────────┘        │
+  ┌────────────────────────────────────┐        │
+  │  cluster: orphan-gc (own JM+TM)     │────────┘ deletes orphans
+  │  TableMaintenance: DeleteOrphanFiles│
+  └────────────────────────────────────┘
+   maintenance & orphan-gc share ONE Postgres lock (id db.events)
+   → lock serialises orphan GC vs expire/rewrite (no S3-404 race)
         catalog + maintenance lock: Postgres (Iceberg JDBC catalog)
 ```
 
-Both clusters run the **same image** (`IcebergCatalog` holds the shared
+All three clusters run the **same image** (`IcebergCatalog` holds the shared
 schema/catalog/lock wiring); the Flink Kubernetes Operator runs each as its
 own Application-Mode cluster from one `FlinkDeployment` each. The
-Postgres-backed `JdbcLockFactory` is honoured **across the two clusters**, so
-compaction, expiration and orphan-file removal never collide with ingest
-commits.
+Postgres-backed `JdbcLockFactory` (lock id `db.events`) is honoured **across
+all clusters**: it keeps maintenance/orphan-GC from colliding with ingest
+commits *and*, because `maintenance` and `orphan-gc` take the **same** lock
+id, serialises orphan removal against `ExpireSnapshots`'s deletes.
 
-* **Isolation:** ingest and maintenance get separate JobManager/TaskManager
-  pods — independent memory/CPU budgets and failure domains (a maintenance
-  OOM/crash cannot starve or take down ingest).
+* **Isolation:** ingest, maintenance and orphan-gc each get separate
+  JobManager/TaskManager pods — independent memory/CPU budgets and failure
+  domains (one job's OOM/crash cannot starve or take down another).
 * **Catalog:** Iceberg **JDBC catalog** on Postgres; the same Postgres backs
   the maintenance `JdbcLockFactory`.
 * **Storage:** MinIO via Iceberg `S3FileIO` (path-style, `s3://warehouse`).
@@ -71,10 +79,13 @@ commits.
 
 * **Docker**, **minikube**, **kubectl**, **helm**.
 * **~8 GB of memory available to Docker.** `scripts/minikube-up.sh` starts
-  minikube with `--memory=7600` by default (override with `MINIKUBE_MEMORY`)
-  to fit two Flink clusters + Kafka + MinIO + Postgres + the operator. True
-  resource isolation costs more RAM than the old single-cluster setup — that
-  is the tradeoff being demonstrated.
+  minikube with `--memory=8000` by default (override with `MINIKUBE_MEMORY`)
+  to fit **three** Flink clusters + Kafka + MinIO + Postgres + the operator.
+  Per-cluster Flink memory is tuned lean (JM 512m / TM 768m, with Flink's
+  metaspace/overhead/managed components explicitly shrunk in
+  `flinkConfiguration` so those small sizes are valid); true resource
+  isolation costs more RAM than a shared cluster — that is the tradeoff being
+  demonstrated, and on an 8 GB box this footprint is genuinely tight.
 
 ## Quick start
 
@@ -93,28 +104,30 @@ That will, in order:
 4. Deploy infra: `postgres`, `minio` (+ a `bucket-setup` sidecar that creates
    the `warehouse` bucket), `kafka` (KRaft, auto-creates `events` with 3
    partitions), `datagen`.
-5. Apply the two `FlinkDeployment`s — `ingest` and `maintenance`.
+5. Apply the three `FlinkDeployment`s — `ingest`, `maintenance`
+   (rewrite+expire) and `orphan-gc`.
 
 First run downloads the minikube base image + Maven dependencies, so give it
 several minutes.
 
 ## Verify it works
 
-**The two isolated clusters** — separate JM/TM pods per job is the point:
+**The three isolated clusters** — separate JM/TM pods per job is the point:
 
 ```bash
 kubectl -n s3-table-dump get flinkdeployment
-kubectl -n s3-table-dump get pods            # ingest-* and maintenance-* JM/TM
+kubectl -n s3-table-dump get pods   # ingest-* / maintenance-* / orphan-gc-* JM+TM
 ```
 
-Both `FlinkDeployment`s should reach `JOB STATUS: RUNNING` /
+All three `FlinkDeployment`s should reach `JOB STATUS: RUNNING` /
 `LIFECYCLE STATE: STABLE`.
 
-**Flink Web UIs** (one per cluster — two separate UIs by design):
+**Flink Web UIs** (one per cluster — three separate UIs by design):
 
 ```bash
 kubectl -n s3-table-dump port-forward svc/ingest-rest 8081:8081       # ingest
-kubectl -n s3-table-dump port-forward svc/maintenance-rest 8082:8081  # maintenance
+kubectl -n s3-table-dump port-forward svc/maintenance-rest 8082:8081  # rewrite+expire
+kubectl -n s3-table-dump port-forward svc/orphan-gc-rest 8083:8081    # orphan GC
 ```
 
 **MinIO console** — `kubectl -n s3-table-dump port-forward svc/minio 9001:9001`
@@ -142,13 +155,19 @@ kubectl -n s3-table-dump exec deploy/postgres -- \
 
 ## Tuning
 
-Maintenance behaviour is set in
+Rewrite/expire behaviour is in
 [`IcebergMaintenanceJob.java`](src/main/java/com/example/flinkiceberg/IcebergMaintenanceJob.java):
 
 * `RewriteDataFiles.scheduleOnCommitCount(3)` / `targetFileSizeBytes(64MB)`
 * `ExpireSnapshots.scheduleOnCommitCount(5)` / `maxSnapshotAge(5 min)` / `retainLast(3)`
-* `DeleteOrphanFiles.scheduleOnInterval(30 min)` / `minAge(10 min)` / `usePrefixListing(true)` (infrequent — minimises, but cannot eliminate, the race with ExpireSnapshots; see *Known limitation* below)
 * `TableMaintenance.rateLimit(1 min)` / `lockCheckDelay(10 s)`
+
+Orphan-GC behaviour is in
+[`IcebergOrphanGcJob.java`](src/main/java/com/example/flinkiceberg/IcebergOrphanGcJob.java):
+
+* `DeleteOrphanFiles.scheduleOnInterval(15 min)` / `minAge(10 min)` / `usePrefixListing(true)`
+* Same `IcebergCatalog.lockFactory()` (lock id `db.events`) as the maintenance
+  job → the Postgres lock serialises it against rewrite/expire.
 
 Ingest behaviour (Kafka source, checkpoint interval) is in
 [`KafkaToIcebergJob.java`](src/main/java/com/example/flinkiceberg/KafkaToIcebergJob.java).
@@ -156,7 +175,7 @@ Both jobs read all connection settings from environment variables with
 defaults that match the in-cluster Service names (`kafka`, `postgres`,
 `minio`) — see
 [`IcebergCatalog.fromEnv()`](src/main/java/com/example/flinkiceberg/IcebergCatalog.java),
-so only `AWS_REGION` is set explicitly in the `FlinkDeployment`s. Per-cluster
+so only `S3_REGION` is set explicitly in the `FlinkDeployment`s. Per-cluster
 CPU/memory live in [`k8s/flink-ingest.yaml`](k8s/flink-ingest.yaml) and
 [`k8s/flink-maintenance.yaml`](k8s/flink-maintenance.yaml).
 
@@ -259,20 +278,39 @@ forwards to `-Drevision`. Override with `APP_VERSION=… scripts/minikube-up.sh`
   that one cluster only; for a clean restart use `scripts/minikube-down.sh`
   then `scripts/minikube-up.sh`.
 
-### Known limitation — `DeleteOrphanFiles` ↔ `ExpireSnapshots` race
+### Design note — orphan GC is isolated and lock-serialised
 
-`DeleteOrphanFiles` lists the table prefix and HEADs candidate files
-(`BaseS3File.getObjectMetadata`); when `ExpireSnapshots` deletes
-snapshot/manifest files in the same window, the HEAD can hit a transient
-**S3 404 (`NoSuchKeyException`)** and that orphan run reports
-`TaskResult{success=false}`. This is **inherent** to running orphan removal
-alongside another file-deleting task in one job — not a config bug — and is
-**contained**: the maintenance *job* stays `RUNNING` with `numRestarts=0` and
-no exception-history entry; only that orphan pass is skipped and it retries on
-the next 30-min interval. RewriteDataFiles and ExpireSnapshots are unaffected.
-Validated state: ingest + maintenance `numRestarts=0` / 0 exceptions;
-RewriteDataFiles + ExpireSnapshots `success=true`; DeleteOrphanFiles
-intermittently `success=false` on MinIO via this race (it succeeded under the
-earlier single-JVM session run, so it is timing/state-sensitive, not broken).
-For production, run orphan removal **isolated** from concurrent deleters (its
-own infrequent job/window) rather than in the same `TableMaintenance` graph.
+Earlier, `DeleteOrphanFiles` ran in the same `TableMaintenance` graph as
+`ExpireSnapshots`. Orphan detection HEADs candidate files
+(`BaseS3File.getObjectMetadata`); when `ExpireSnapshots` deleted
+snapshot/manifest files in the same window, the HEAD hit a transient **S3 404
+(`NoSuchKeyException`)** and that orphan pass reported
+`TaskResult{success=false}` — inherent to running orphan removal beside
+another file-deleter in one graph.
+
+The fix: orphan removal now lives in its own job/cluster
+(`IcebergOrphanGcJob` → the `orphan-gc` `FlinkDeployment`) that uses the
+**same** Postgres maintenance lock (`IcebergCatalog.lockFactory()`, lock id
+`db.events`) as the `maintenance` job. `TableMaintenance` acquires that lock
+around each maintenance cycle, so the lock factory **serialises orphan GC
+against rewrite/expire** — they can no longer delete files underneath each
+other — while orphan GC still gets its own isolated cluster (own JM+TM,
+independent failure domain), consistent with the rest of the design. Orphan GC
+also runs infrequently (`scheduleOnInterval(15 min)`) so it mostly finds the
+lock free.
+
+Validated end-to-end on minikube: all three clusters `RUNNING/STABLE`,
+`numRestarts=0`, exception-history empty (0 entries) for all jobs;
+`orphan-gc` is observed to take the shared lock
+(`Created/Deleted JdbcLock{type=MAINTENANCE, lockId=db.events}` in its TM
+logs). The shared-lock serialisation path therefore works as designed.
+
+What the validation *also* showed: the underlying Iceberg-Flink
+`DeleteOrphanFiles` ↔ `S3FileIO`-on-MinIO interaction can **still** surface a
+`NoSuchKeyException` (404) on `BaseS3File.getObjectMetadata`, because
+`ExpireSnapshots`' bulk-delete tail can continue past the lock release window
+and the orphan detector lists then HEADs files. That's an Iceberg-operator-
+level race we can't fix from outside the operator. It remains **contained**:
+job stays `RUNNING`, `numRestarts=0`, exception-history empty, only the
+individual orphan pass is `TaskResult{success=false}`, and it retries on the
+next 15-min interval.

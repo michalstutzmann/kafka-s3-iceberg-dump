@@ -13,7 +13,7 @@ set -euo pipefail
 NS=s3-table-dump
 IMAGE="${IMAGE:-s3-table-dump:dev}"
 OPERATOR_VERSION="${OPERATOR_VERSION:-1.14.0}"
-MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-7600}"
+MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-8000}"
 MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -66,8 +66,8 @@ for d in postgres minio kafka; do
   kubectl -n "${NS}" rollout status deploy/"$d" --timeout=240s
 done
 
-echo "==> Flink Application clusters (ingest + maintenance)"
-kubectl apply -f k8s/flink-ingest.yaml -f k8s/flink-maintenance.yaml
+echo "==> Flink Application clusters (ingest + maintenance + orphan-gc)"
+kubectl apply -f k8s/flink-ingest.yaml -f k8s/flink-maintenance.yaml -f k8s/flink-orphan-gc.yaml
 
 cat <<EOF
 
@@ -77,7 +77,8 @@ Deployed. Watch it come up:
 
 Flink UIs (separate cluster per job — the whole point):
   kubectl -n ${NS} port-forward svc/ingest-rest 8081:8081        # ingest
-  kubectl -n ${NS} port-forward svc/maintenance-rest 8082:8081   # maintenance
+  kubectl -n ${NS} port-forward svc/maintenance-rest 8082:8081   # maintenance (rewrite+expire)
+  kubectl -n ${NS} port-forward svc/orphan-gc-rest 8083:8081     # orphan GC
 MinIO console:
   kubectl -n ${NS} port-forward svc/minio 9001:9001              # admin/password
 EOF
