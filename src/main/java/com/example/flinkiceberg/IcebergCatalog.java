@@ -25,17 +25,20 @@ import org.apache.iceberg.flink.maintenance.api.TriggerLockFactory;
 import org.apache.iceberg.types.Types;
 
 /**
- * Shared Iceberg catalog/table wiring used by both Flink jobs in this demo:
- * the {@link KafkaToIcebergJob} ingest job and the {@link IcebergMaintenanceJob}
- * maintenance job.
+ * Shared Iceberg catalog/table wiring used by all three Flink jobs in this
+ * demo: the {@link KafkaToIcebergJob} ingest job, the
+ * {@link IcebergMaintenanceJob} (rewrite + expire) and the
+ * {@link IcebergOrphanGcJob} (orphan-file removal).
  *
- * <p>The two jobs are deployed separately so ingest and maintenance have
- * independent lifecycles and failure domains; this class keeps the parts they
- * must agree on — schema, env-driven catalog config, and the Postgres-backed
- * maintenance lock wiring — in one place.
+ * <p>The three jobs are deployed as separate Application-Mode clusters so
+ * they have independent lifecycles, failure domains and resource budgets;
+ * this class keeps the parts they must agree on — schema, env-driven catalog
+ * config, and the Postgres-backed maintenance lock wiring — in one place.
+ * {@code maintenance} and {@code orphan-gc} share the same {@code db.events}
+ * lock id, so the lock serialises orphan GC against expire/rewrite.
  *
- * <p>All settings are environment-driven so the same jar runs locally and in
- * the Docker Compose stack.
+ * <p>All settings are environment-driven so the same jar runs locally and
+ * inside the minikube/Application-Mode deployment.
  */
 final class IcebergCatalog {
 
@@ -135,10 +138,11 @@ final class IcebergCatalog {
 
   /**
    * Block until Postgres accepts a JDBC connection, retrying with a fixed
-   * delay. Run in the Flink client JVM (the {@code submitter}) before the job
-   * graph is built, this is a <em>fail-fast pre-flight</em>: if Postgres is
-   * genuinely down/misconfigured it surfaces a clear error from the submitter
-   * before any job is created, instead of a cryptic deploy-time job failure.
+   * delay. In Application Mode each job's {@code main()} runs in its
+   * JobManager pod, so this executes there before the job graph is built —
+   * a <em>fail-fast pre-flight</em>: if Postgres is genuinely
+   * down/misconfigured it surfaces a clear error from the JM pod instead of
+   * a cryptic deploy-time job failure.
    *
    * <p>It does <b>not</b> prevent the TaskManager cold-connect race — that
    * connection is made on the TM operator; absorbing that transient is
@@ -179,10 +183,10 @@ final class IcebergCatalog {
   }
 
   /**
-   * Idempotently ensure the namespace and table exist. Both jobs call this so
-   * either can be deployed first; concurrent creation (e.g. both submitted at
-   * once) is tolerated by swallowing {@link AlreadyExistsException}. Runs in
-   * the Flink client JVM (the {@code submitter} container).
+   * Idempotently ensure the namespace and table exist. All three jobs call
+   * this so any of them can be deployed first; concurrent creation is
+   * tolerated by swallowing {@link AlreadyExistsException}. In Application
+   * Mode this runs in the JobManager pod (where {@code main()} executes).
    */
   void ensureTable() {
     // org.apache.iceberg.catalog.Catalog is not AutoCloseable; close manually.
