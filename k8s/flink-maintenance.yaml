@@ -1,0 +1,50 @@
+# Maintenance job as its OWN Flink Application-Mode cluster (separate
+# JobManager + TaskManager pods from the ingest cluster). Independent memory
+# budget + failure domain — closing the "logical split only" limitation of
+# the single session cluster.
+#
+# Runs RewriteDataFiles + ExpireSnapshots + DeleteOrphanFiles. The
+# Postgres-backed JdbcLockFactory (same Postgres as ingest's catalog) keeps
+# maintenance and ingest commits from colliding across the two clusters.
+# RetryingTriggerLockFactory still absorbs the JDBC cold-connect race in-place.
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: maintenance
+  namespace: s3-table-dump
+spec:
+  image: s3-table-dump:dev
+  imagePullPolicy: Never
+  flinkVersion: v2_0
+  serviceAccount: flink
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "1"
+    state.backend.type: hashmap
+    execution.checkpointing.interval: "30s"
+    # Force the PostgreSQL driver to load from Flink's parent (system)
+    # classloader — where /opt/flink/lib + java.sql.DriverManager live — so
+    # the JDBC catalog never hits a child-first driver-registration race
+    # ("No suitable driver found") on the JM SourceCoordinator at startup.
+    classloader.parent-first-patterns.additional: "org.postgresql."
+    restart-strategy.type: fixed-delay
+    restart-strategy.fixed-delay.attempts: "3"
+    restart-strategy.fixed-delay.delay: "5 s"
+  jobManager:
+    resource:
+      memory: "768m"
+      cpu: 0.25
+  taskManager:
+    resource:
+      memory: "1280m"
+      cpu: 0.5
+  podTemplate:
+    spec:
+      containers:
+        - name: flink-main-container
+          env:
+            - { name: AWS_REGION, value: "us-east-1" }
+  job:
+    jarURI: local:///opt/flink/usrlib/app.jar
+    entryClass: com.example.flinkiceberg.IcebergMaintenanceJob
+    parallelism: 1
+    upgradeMode: stateless

@@ -1,0 +1,71 @@
+# S3-compatible storage. alpine/minio is the maintained community rebuild
+# (MinIO archived its own Docker Hub repo in 2025); it runs as uid 100 by
+# default so we force uid 0 to write the emptyDir. No `mc`: a `bucket-setup`
+# sidecar shares the data volume and, once minio has formatted the drive
+# (.minio.sys appears), creates the `warehouse` bucket via `mkdir`
+# (a top-level dir IS a bucket in MinIO's single-drive backend).
+# Service name "minio" matches the S3_ENDPOINT default (http://minio:9000).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: s3-table-dump
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: minio
+          image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: admin }
+            - { name: MINIO_ROOT_PASSWORD, value: password }
+          ports:
+            - { containerPort: 9000 }
+            - { containerPort: 9001 }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests: { memory: "320Mi", cpu: "100m" }
+            limits: { memory: "640Mi" }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+        - name: bucket-setup
+          image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until [ -d /data/.minio.sys ]; do
+                echo 'waiting for minio to format drive...'; sleep 2;
+              done
+              mkdir -p /data/warehouse
+              echo 'minio bucket ready'
+              sleep infinity
+          resources:
+            requests: { memory: "16Mi", cpu: "10m" }
+            limits: { memory: "32Mi" }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: s3-table-dump
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }

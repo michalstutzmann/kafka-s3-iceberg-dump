@@ -66,12 +66,20 @@ public final class IcebergMaintenanceJob {
                 .deleteBatchSize(100))
         .add(
             // Least urgent and most expensive (it lists the whole table
-            // prefix), so it runs least often. minAge is kept well above the
-            // ingest commit cadence so files from an in-flight commit are
-            // never mistaken for orphans; usePrefixListing uses S3-style
-            // object listing, which is correct for the S3FileIO/MinIO store.
+            // prefix and HEADs candidates). Run on a long, infrequent interval
+            // to MINIMISE — not eliminate — its inherent race with
+            // ExpireSnapshots: orphan detection HEADs files
+            // (BaseS3File.getObjectMetadata) that a concurrent ExpireSnapshots
+            // run may delete underneath it, surfacing a transient S3 404
+            // (NoSuchKey). That race is fundamental to running orphan removal
+            // alongside another file-deleting task in the same job; it is
+            // contained (the task's TaskResult is success=false, the job stays
+            // RUNNING, it retries next interval) — see README "known
+            // limitation". minAge stays well above the ingest commit cadence
+            // so in-flight files are never mistaken for orphans;
+            // usePrefixListing uses S3-style listing (correct for S3FileIO).
             DeleteOrphanFiles.builder()
-                .scheduleOnCommitCount(10)
+                .scheduleOnInterval(Duration.ofMinutes(30))
                 .minAge(Duration.ofMinutes(10))
                 .usePrefixListing(true)
                 .deleteBatchSize(100))

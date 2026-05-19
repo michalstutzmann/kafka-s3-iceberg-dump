@@ -1,0 +1,8 @@
+# Single namespace for the whole demo (infra + operator + both Flink app
+# clusters). The Flink Kubernetes Operator is installed with
+# watchNamespaces={s3-table-dump} and rbac.create=true, so it creates the
+# `flink` ServiceAccount + RBAC the JobManagers need in this namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: s3-table-dump

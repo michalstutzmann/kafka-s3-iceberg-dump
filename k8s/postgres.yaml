@@ -1,0 +1,50 @@
+# Iceberg JDBC catalog + maintenance JdbcLockFactory store.
+# emptyDir (demo): catalog is recreated on restart. Service name "postgres"
+# matches IcebergCatalog.fromEnv()'s default jdbc:postgresql://postgres:5432.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: s3-table-dump
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17.10
+          env:
+            - { name: POSTGRES_USER, value: iceberg }
+            - { name: POSTGRES_PASSWORD, value: iceberg }
+            - { name: POSTGRES_DB, value: iceberg }
+            # default data dir is on the emptyDir mount below
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { containerPort: 5432 }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "iceberg", "-d", "iceberg"] }
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 20
+          resources:
+            requests: { memory: "192Mi", cpu: "100m" }
+            limits: { memory: "320Mi" }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: s3-table-dump
+spec:
+  selector: { app: postgres }
+  ports:
+    - { port: 5432, targetPort: 5432 }

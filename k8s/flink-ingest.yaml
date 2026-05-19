@@ -1,0 +1,50 @@
+# Ingest job as its OWN Flink Application-Mode cluster (dedicated JobManager
+# + TaskManager pods). This is the point of the migration: ingest and
+# maintenance no longer share a TaskManager, so they have isolated memory /
+# CPU budgets and fully independent failure domains.
+#
+# Service names (kafka/postgres/minio) match IcebergCatalog.fromEnv() and
+# KafkaToIcebergJob defaults, so only AWS_REGION needs to be set explicitly.
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: ingest
+  namespace: s3-table-dump
+spec:
+  image: s3-table-dump:dev
+  imagePullPolicy: Never            # use the image built into minikube's docker
+  flinkVersion: v2_0
+  serviceAccount: flink
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "1"
+    state.backend.type: hashmap
+    execution.checkpointing.interval: "30s"
+    # Force the PostgreSQL driver to load from Flink's parent (system)
+    # classloader — where /opt/flink/lib + java.sql.DriverManager live — so
+    # the JDBC catalog never hits a child-first driver-registration race
+    # ("No suitable driver found") on the JM SourceCoordinator at startup.
+    classloader.parent-first-patterns.additional: "org.postgresql."
+    # Bounded recovery (same intent as the old compose setting): a residual
+    # transient recovers fast; a genuinely broken job fails fast.
+    restart-strategy.type: fixed-delay
+    restart-strategy.fixed-delay.attempts: "3"
+    restart-strategy.fixed-delay.delay: "5 s"
+  jobManager:
+    resource:
+      memory: "768m"
+      cpu: 0.25
+  taskManager:
+    resource:
+      memory: "1280m"
+      cpu: 0.5
+  podTemplate:
+    spec:
+      containers:
+        - name: flink-main-container
+          env:
+            - { name: AWS_REGION, value: "us-east-1" }
+  job:
+    jarURI: local:///opt/flink/usrlib/app.jar
+    entryClass: com.example.flinkiceberg.KafkaToIcebergJob
+    parallelism: 1
+    upgradeMode: stateless
