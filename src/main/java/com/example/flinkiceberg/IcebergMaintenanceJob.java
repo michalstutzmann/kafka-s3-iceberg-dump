@@ -27,9 +27,9 @@ import org.apache.iceberg.flink.maintenance.api.TriggerLockFactory;
  *
  * <p>Deployed separately from {@link KafkaToIcebergJob} so maintenance and
  * ingest have independent lifecycles, failure domains and resource budgets.
- * Concurrent commits against the table are made safe by the Postgres-backed
- * {@link TriggerLockFactory} from {@link IcebergCatalog} — the same lock store
- * the ingest job's catalog uses, so the lock holds across all jobs.
+ * The Postgres-backed {@link TriggerLockFactory} from {@link IcebergCatalog}
+ * coordinates this job with {@link IcebergOrphanGcJob}; ingest writes do not
+ * use this maintenance lock and rely on Iceberg's optimistic commits.
  */
 public final class IcebergMaintenanceJob {
 

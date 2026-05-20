@@ -59,7 +59,7 @@ up on **minikube** with a single `scripts/minikube-up.sh`.
   │  TableMaintenance: DeleteOrphanFiles│
   └────────────────────────────────────┘
    ▲                                  ▲
-   │ wake every 30m, sleep 180s       │ wake every 6h, sleep 180s
+   │ wake every 30m, sleep 240s       │ wake every 6h, sleep 240s
    │   CronJob maintenance-runner     │   CronJob orphan-gc-runner
    └──────── k8s/maintenance-cron.yaml ─────────┘
        (patches spec.job.state running⇄suspended)
@@ -72,11 +72,12 @@ up on **minikube** with a single `scripts/minikube-up.sh`.
 All three clusters run the **same image** (`IcebergCatalog` holds the shared
 schema/catalog/lock wiring); the Flink Kubernetes Operator runs each as its
 own Application-Mode cluster from one `FlinkDeployment` each. The
-Postgres-backed `JdbcLockFactory` (lock id `db.events`) is honoured **across
-all clusters**: it keeps maintenance/orphan-GC from colliding with ingest
-commits *and*, because `maintenance` and `orphan-gc` take the **same** lock
-id, serialises orphan removal against `ExpireSnapshots`'s deletes whenever
-the two wake windows overlap.
+Postgres-backed `JdbcLockFactory` (lock id `db.events`) is honoured across
+the two maintenance clusters: because `maintenance` and `orphan-gc` take the
+**same** lock id, it serialises orphan removal against `ExpireSnapshots`'
+deletes whenever the two wake windows overlap. Ingest does not use this
+maintenance lock; its writes rely on Iceberg's normal optimistic commit
+protocol.
 
 * **Isolation:** ingest, maintenance and orphan-gc each get separate
   JobManager/TaskManager pods — independent memory/CPU budgets and failure
@@ -85,7 +86,7 @@ the two wake windows overlap.
   `FlinkDeployment`s ship with `spec.job.state: suspended`; the
   `maintenance-runner` and `orphan-gc-runner` `CronJob`s in
   [`k8s/maintenance-cron.yaml`](k8s/maintenance-cron.yaml) flip them to
-  `running` on schedule, sleep for the wake window (default 3 min), then
+  `running` on schedule, sleep for the wake window (default 240 s), then
   flip back to `suspended`. Outside wake windows those two clusters have
   **zero** JM/TM pods, freeing minikube RAM for ingest + infra.
 * **Catalog:** Iceberg **JDBC catalog** on Postgres; the same Postgres backs
@@ -218,7 +219,7 @@ Orphan-GC behaviour is in
 * `TableMaintenance.rateLimit(1 min)` — Iceberg gates the first trigger fire
   after a stateless cold start by `max(interval, rateLimit)`, so both values
   MUST be shorter than the cron wake window or the pass never fires. With
-  a 180 s wake, ~60 s elapses before the first orphan pass; a second pass
+  a 240 s wake, ~60 s elapses before the first orphan pass; a second pass
   may run before suspend (idempotent, so harmless).
 * Same `IcebergCatalog.lockFactory()` (lock id `db.events`) as the maintenance
   job → the Postgres lock serialises it against rewrite/expire when wake
@@ -229,7 +230,7 @@ Cron schedule + wake duration live in
 
 * `schedule:` — `*/30 * * * *` for rewrite/expire, `0 */6 * * *` for orphan GC.
 * The `sleep` value inside each CronJob's command is the wake window
-  (default 180 s). Bump it if your minikube is slow enough that JM+TM
+  (default 240 s). Bump it if your minikube is slow enough that JM+TM
   cold-start eats too much of the window before the in-job triggers tick.
 * `concurrencyPolicy: Forbid` — overlapping wakes against the same
   FlinkDeployment can't happen.
@@ -365,8 +366,8 @@ snapshot history (per Iceberg's `MonitorSource`), so the trigger fires on
 the first source tick after wake without needing any persisted "since job
 start" state. Orphan GC uses `scheduleOnInterval(20 s)`, kept shorter than
 the wake window because Iceberg waits the full interval of wall-clock from
-cold start before its first trigger; orphan GC's `rateLimit(5 min)` is in
-turn longer than the wake window, so exactly one orphan pass runs per wake.
+cold start before its first trigger; orphan GC's `rateLimit(1 min)` is also
+kept shorter than the wake window, so at least one orphan pass runs per wake.
 A wake interrupted mid-commit is harmless — Iceberg metadata commits are
 atomic, and any half-deleted files become orphans cleaned up later. A wake
 interrupted **mid-lock-hold** is less benign: Iceberg's `JdbcLockFactory`
@@ -381,7 +382,7 @@ kubectl -n s3-table-dump exec deploy/postgres -- \
 ```
 
 In normal operation this isn't reached: maintenance tasks finish in seconds,
-well inside the 180 s wake window, so the lock is released before the cron
+well inside the 240 s wake window, so the lock is released before the cron
 suspends the cluster. The risk is only real if a task runs long enough to
 still be holding the lock when `state: suspended` is patched.
 

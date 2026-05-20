@@ -132,7 +132,7 @@ scripts/minikube-down.sh --keep-cluster   # only remove the app + operator
 ## Gotchas
 
 * Only the ingest cluster runs continuously. `maintenance` and `orphan-gc`
-  pods exist only inside a cron-triggered wake window (default 3 min;
+  pods exist only inside a cron-triggered wake window (default 240 s;
   `sleep` value in `k8s/maintenance-cron.yaml`). Outside that window
   `kubectl get pods` will show no JM/TM for those two clusters — that's the
   point, not a failure. To verify wake plumbing without waiting for cron,
@@ -181,7 +181,7 @@ scripts/minikube-down.sh --keep-cluster   # only remove the app + operator
   hasn't released the lock by the time the CronJob's tail patches
   `state: suspended`, the operator kills the TM mid-hold and we lose the
   lock. In practice tasks finish in seconds against the small demo table,
-  well inside the 180 s wake window, so it doesn't bite — but don't
+  well inside the 240 s wake window, so it doesn't bite — but don't
   shorten the wake window below the slowest task's duration. Manual clear:
   `psql -c "DELETE FROM flink_maintenance_lock WHERE LOCK_ID='db.events';"`.
 * Re-applying a `FlinkDeployment` makes the operator redeploy *that one*
