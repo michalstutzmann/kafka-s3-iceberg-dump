@@ -9,6 +9,14 @@
 # other. Ingest writes don't use this lock; they rely on Iceberg's normal
 # optimistic commit protocol. RetryingTriggerLockFactory still absorbs the
 # JDBC cold-connect race in-place on the TaskManager.
+#
+# The cluster ships SUSPENDED (spec.job.state) so no JM/TM pods exist by
+# default — the `maintenance-runner` CronJob (k8s/maintenance-cron.yaml) flips
+# state to `running` on its schedule, lets one pass complete, and flips back
+# to `suspended`. With `upgradeMode: stateless` each wake is a cold start with
+# no prior trigger state; that is fine here because the commit-count triggers
+# below count against the table's all-time snapshot history (not since-job-
+# start), so they fire on the first source tick after wake.
 apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:
@@ -65,3 +73,6 @@ spec:
     entryClass: com.example.flinkiceberg.IcebergMaintenanceJob
     parallelism: 1
     upgradeMode: stateless
+    # Start suspended; the maintenance-runner CronJob patches this to
+    # `running` on schedule and back to `suspended` after the wake window.
+    state: suspended

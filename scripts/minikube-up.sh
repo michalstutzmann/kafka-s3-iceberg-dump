@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Bring up the whole demo on minikube: build the app image into minikube's
 # docker, install the Flink Kubernetes Operator, deploy infra (Kafka, MinIO,
-# Postgres, datagen) and the two Application-Mode Flink clusters (ingest +
-# maintenance). Idempotent — safe to re-run.
+# Postgres, datagen) and the three Application-Mode Flink clusters (ingest
+# runs continuously; maintenance + orphan-gc ship SUSPENDED and are woken on
+# a schedule by the maintenance-cron CronJobs). Idempotent — safe to re-run.
 #
 #   scripts/minikube-up.sh
 #
@@ -13,7 +14,10 @@ set -euo pipefail
 NS=s3-table-dump
 IMAGE="${IMAGE:-s3-table-dump:dev}"
 OPERATOR_VERSION="${OPERATOR_VERSION:-1.14.0}"
-MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-8000}"
+# 7600 fits an 8 GB Docker allocation (minikube refuses if the request
+# exceeds Docker's available memory). Steady state only runs the ingest
+# cluster + infra; the suspended maintenance clusters wake briefly on cron.
+MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-7600}"
 MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -69,13 +73,25 @@ done
 echo "==> Flink Application clusters (ingest + maintenance + orphan-gc)"
 kubectl apply -f k8s/flink-ingest.yaml -f k8s/flink-maintenance.yaml -f k8s/flink-orphan-gc.yaml
 
+echo "==> maintenance CronJobs (wake the suspended maintenance/orphan-gc clusters on schedule)"
+kubectl apply -f k8s/maintenance-cron.yaml
+
 cat <<EOF
 
 Deployed. Watch it come up:
   kubectl -n ${NS} get flinkdeployment,pods
   kubectl -n ${NS} logs deploy/datagen -f
 
-Flink UIs (separate cluster per job — the whole point):
+Only the ingest cluster runs continuously. The maintenance + orphan-gc
+clusters ship SUSPENDED and only have JM/TM pods during a cron-triggered
+wake window. Cron schedule + wake length live in k8s/maintenance-cron.yaml.
+
+  kubectl -n ${NS} get cronjob
+  kubectl -n ${NS} get jobs   # one Job per cron firing; pod logs the wake
+  # Force a wake now (any of the two), e.g. for the maintenance cluster:
+  kubectl -n ${NS} create job --from=cronjob/maintenance-runner maintenance-now
+
+Flink UIs (one per cluster; maintenance/orphan-gc UIs only respond mid-wake):
   kubectl -n ${NS} port-forward svc/ingest-rest 8081:8081        # ingest
   kubectl -n ${NS} port-forward svc/maintenance-rest 8082:8081   # maintenance (rewrite+expire)
   kubectl -n ${NS} port-forward svc/orphan-gc-rest 8083:8081     # orphan GC

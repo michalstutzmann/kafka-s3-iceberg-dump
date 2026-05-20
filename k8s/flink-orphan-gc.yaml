@@ -3,6 +3,12 @@
 # (db.events) as the rewrite/expire `maintenance` cluster, so the lock factory
 # serialises orphan GC against ExpireSnapshots' deletes — fixing the S3-404
 # race without giving up isolation.
+#
+# Ships SUSPENDED (spec.job.state) so no JM/TM pods exist by default — the
+# `orphan-gc-runner` CronJob (k8s/maintenance-cron.yaml) flips state to
+# `running` on its schedule and back. The in-job trigger is a short interval
+# (see IcebergOrphanGcJob) so a pass fires inside the wake window even with
+# `upgradeMode: stateless` (cold start each wake, no carried trigger state).
 apiVersion: flink.apache.org/v1beta1
 kind: FlinkDeployment
 metadata:
@@ -55,3 +61,6 @@ spec:
     entryClass: com.example.flinkiceberg.IcebergOrphanGcJob
     parallelism: 1
     upgradeMode: stateless
+    # Start suspended; the orphan-gc-runner CronJob patches this to
+    # `running` on schedule and back to `suspended` after the wake window.
+    state: suspended

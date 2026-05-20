@@ -10,6 +10,7 @@ cd "$REPO_ROOT"
 
 if [[ "${1:-}" == "--keep-cluster" ]]; then
   echo "==> deleting Flink apps + infra (keeping minikube)"
+  kubectl delete -f k8s/maintenance-cron.yaml --ignore-not-found
   kubectl delete -f k8s/flink-ingest.yaml -f k8s/flink-maintenance.yaml -f k8s/flink-orphan-gc.yaml --ignore-not-found
   helm uninstall flink-kubernetes-operator -n "${NS}" --ignore-not-found 2>/dev/null || true
   kubectl delete namespace "${NS}" --ignore-not-found
