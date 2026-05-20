@@ -22,7 +22,7 @@ import org.apache.iceberg.flink.maintenance.api.TriggerLockFactory;
  * because both the trigger's {@code lastTriggerTime} and the rate limiter's
  * {@code lastFireTime} are initialised to job-start. So both values MUST
  * stay shorter than the cron wake window or the pass never fires. With
- * {@code scheduleOnInterval(20s)} + {@code rateLimit(1min)} and a 180-second
+ * {@code scheduleOnInterval(20s)} + {@code rateLimit(1min)} and a 240-second
  * wake, the first orphan pass fires ~60 s after TaskManager start
  * (well inside the wake) and may fire once more before the cron suspends
  * the cluster — both passes are idempotent so the extra fire is harmless.
