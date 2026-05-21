@@ -1,5 +1,5 @@
 # Kafka Connect worker image for the Apache Iceberg sink connector — this is
-# the INGEST path (it replaces the old Flink KafkaToIcebergJob). Built into
+# the INGEST path. Built into
 # minikube's docker by scripts/minikube-up.sh; k8s/kafka-connect.yaml runs it
 # with imagePullPolicy: Never.
 #

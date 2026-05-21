@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Build-only helper POM. It does NOT produce the app jar (that is the root
-  pom.xml, the Flink maintenance jobs) and is NOT published anywhere — its sole
+  pom.xml, the Spark maintenance jobs) and is NOT published anywhere — its sole
   job is to gather the Apache Iceberg Kafka Connect sink connector and the
   dependencies it needs (S3FileIO/AWS, Postgres JDBC driver, Hadoop) into one
   directory that becomes a Kafka Connect plugin (see Dockerfile.connect).
@@ -12,7 +12,7 @@
   `mvn -f kafka-connect/pom.xml dependency:copy-dependencies`.
 
   Versions are pinned and kept in lockstep with the root pom.xml
-  (iceberg.version, hadoop.version) so the connector and the Flink maintenance
+  (iceberg.version, hadoop.version) so the connector and the Spark maintenance
   jobs run against the same Iceberg line. The <version> here is a build-only
   placeholder (this artifact is never installed/released).
 -->
@@ -30,7 +30,7 @@
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <!-- keep in lockstep with ../pom.xml -->
-    <iceberg.version>1.10.2</iceberg.version>
+    <iceberg.version>1.10.1</iceberg.version>
     <hadoop.version>3.4.1</hadoop.version>
     <postgresql.version>42.7.4</postgresql.version>
   </properties>
@@ -47,7 +47,7 @@
 
     <!-- Iceberg's AWS integration: the org.apache.iceberg.aws.* classes,
          including S3FileIO. REQUIRED and separate from the bundle below — the
-         Flink runtime jar shades these in, but the Kafka Connect plugin must
+         Spark maintenance jar bundles these, but the Kafka Connect plugin must
          add iceberg-aws explicitly or the connector fails at startup with
          ClassNotFoundException: org.apache.iceberg.aws.s3.S3FileIO. -->
     <dependency>
@@ -67,7 +67,7 @@
     <!-- Parquet write path: org.apache.iceberg.parquet.Parquet. Iceberg's
          default write format is Parquet and the connector writes via
          GenericAppenderFactory, which needs this module. Like iceberg-aws it
-         is shaded into the Flink runtime jar but NOT pulled transitively by
+         is bundled into the Spark maintenance jar but NOT pulled transitively by
          iceberg-kafka-connect, so the connector hits
          NoClassDefFoundError: org/apache/iceberg/parquet/Parquet without it.
          (iceberg-data + parquet-hadoop already arrive transitively.) -->
@@ -86,7 +86,7 @@
     </dependency>
 
     <!-- Iceberg's catalog loading needs org.apache.hadoop.conf.Configuration on
-         the classpath even with S3FileIO (same reason as the Flink image);
+         the classpath even with S3FileIO (same reason as the Spark image);
          the shaded Hadoop client uber jars are conflict-free. -->
     <dependency>
       <groupId>org.apache.hadoop</groupId>

@@ -1,6 +1,6 @@
 # Kafka Connect worker (distributed mode, single worker) running the Apache
-# Iceberg sink connector — THIS IS THE INGEST PATH, replacing the old Flink
-# ingest cluster. The image (s3-table-dump-connect:dev, built by
+# Iceberg sink connector — THIS IS THE INGEST PATH. The image
+# (s3-table-dump-connect:dev, built by
 # scripts/minikube-up.sh from Dockerfile.connect) adds the Iceberg connector
 # plugin + the Confluent JSON Schema converter to cp-kafka-connect.
 #

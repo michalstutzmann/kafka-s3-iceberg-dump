@@ -19,49 +19,50 @@
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-    <flink.version>2.0.2</flink.version>
-    <iceberg.version>1.10.2</iceberg.version>
+    <spark.version>4.0.1</spark.version>
+    <scala.binary.version>2.13</scala.binary.version>
+    <iceberg.version>1.10.1</iceberg.version>
     <hadoop.version>3.4.1</hadoop.version>
   </properties>
 
   <dependencies>
-    <!-- ===== Flink core: provided by the Flink cluster / image ===== -->
+    <!-- ===== Spark core: provided by the Spark runtime image ===== -->
     <dependency>
-      <groupId>org.apache.flink</groupId>
-      <artifactId>flink-streaming-java</artifactId>
-      <version>${flink.version}</version>
-      <scope>provided</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.flink</groupId>
-      <artifactId>flink-clients</artifactId>
-      <version>${flink.version}</version>
-      <scope>provided</scope>
-    </dependency>
-    <!-- flink-table-runtime ships in the official Flink image /lib; Iceberg needs RowData -->
-    <dependency>
-      <groupId>org.apache.flink</groupId>
-      <artifactId>flink-table-runtime</artifactId>
-      <version>${flink.version}</version>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_${scala.binary.version}</artifactId>
+      <version>${spark.version}</version>
       <scope>provided</scope>
     </dependency>
 
     <!-- ===== Bundled into the fat jar ===== -->
-    <!-- Shaded Iceberg-Flink runtime: includes iceberg-core, sink and the
-         org.apache.iceberg.flink.maintenance.api.* table-maintenance API -->
+    <!-- Shaded Iceberg-Spark runtime: includes Iceberg Spark actions and
+         extensions for Spark 4.0 / Scala 2.13. -->
     <dependency>
       <groupId>org.apache.iceberg</groupId>
-      <artifactId>iceberg-flink-runtime-2.0</artifactId>
+      <artifactId>iceberg-spark-runtime-4.0_${scala.binary.version}</artifactId>
       <version>${iceberg.version}</version>
     </dependency>
-    <!-- S3FileIO + shaded AWS SDK v2 (for MinIO / S3) -->
+
+    <!-- S3FileIO + shaded AWS SDK v2 (for MinIO / S3). -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.apache.iceberg</groupId>
       <artifactId>iceberg-aws-bundle</artifactId>
       <version>${iceberg.version}</version>
     </dependency>
 
-    <!-- Iceberg's CatalogLoader needs org.apache.hadoop.conf.Configuration on the
+    <!-- Parquet rewrite path used by SparkActions.rewriteDataFiles. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-parquet</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+
+    <!-- Iceberg's catalog loading needs org.apache.hadoop.conf.Configuration on the
          classpath even when using S3FileIO; the shaded Hadoop client uber jars
          are conflict-free and avoid pulling a full Hadoop tree. -->
     <dependency>
@@ -140,10 +141,10 @@
               </filters>
               <transformers>
                 <!-- Merge service files: required for Iceberg FileIO, AWS,
-                     Hadoop FileSystem and Flink factory discovery -->
+                     Hadoop FileSystem and Spark/Iceberg discovery -->
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                  <mainClass>com.example.flinkiceberg.IcebergMaintenanceJob</mainClass>
+                  <mainClass>com.example.sparkiceberg.IcebergMaintenanceJob</mainClass>
                 </transformer>
               </transformers>
             </configuration>

@@ -41,7 +41,7 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 10
             failureThreshold: 30
-          # request kept below the limit so three Flink clusters + infra can
+          # request kept below the limit so Spark maintenance pods + infra can
           # still be scheduled on the tight single-node minikube; Kafka grows
           # into the 1536Mi limit at runtime.
           resources:

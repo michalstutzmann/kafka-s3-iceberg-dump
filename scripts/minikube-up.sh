@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
 # Bring up the whole demo on minikube: build the app image into minikube's
-# docker, install the Flink Kubernetes Operator, deploy infra (Kafka, MinIO,
-# Postgres, datagen) and the three Application-Mode Flink clusters (ingest
-# runs continuously; maintenance + orphan-gc ship SUSPENDED and are woken on
-# a schedule by the maintenance-cron CronJobs). Idempotent — safe to re-run.
+# docker, deploy infra (Kafka, MinIO, Postgres, datagen), register the Kafka
+# Connect ingest sink, and install the Spark maintenance CronJobs. Idempotent
+# — safe to re-run.
 #
 #   scripts/minikube-up.sh
 #
-# Overridable via env: MINIKUBE_MEMORY, MINIKUBE_CPUS, OPERATOR_VERSION,
-# IMAGE, CONNECT_IMAGE, APP_VERSION.
+# Overridable via env: MINIKUBE_MEMORY, MINIKUBE_CPUS, IMAGE, CONNECT_IMAGE,
+# APP_VERSION.
 set -euo pipefail
 
 NS=s3-table-dump
 IMAGE="${IMAGE:-s3-table-dump:dev}"
 # Ingest runs on Kafka Connect (Iceberg sink), built from Dockerfile.connect.
 CONNECT_IMAGE="${CONNECT_IMAGE:-s3-table-dump-connect:dev}"
-OPERATOR_VERSION="${OPERATOR_VERSION:-1.14.0}"
 # 7600 fits an 8 GB Docker allocation (minikube refuses if the request
 # exceeds Docker's available memory). Steady state only runs the ingest
-# cluster + infra; the suspended maintenance clusters wake briefly on cron.
+# worker + infra; Spark maintenance pods run briefly on cron.
 MINIKUBE_MEMORY="${MINIKUBE_MEMORY:-7600}"
 MINIKUBE_CPUS="${MINIKUBE_CPUS:-4}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,8 +36,8 @@ fi
 
 echo "==> build images into minikube's docker (APP_VERSION=${APP_VERSION})"
 # Build directly inside minikube's docker daemon so no registry is needed;
-# imagePullPolicy: Never on the FlinkDeployments / Connect pod then uses these
-# local images. Two images: the Flink maintenance jar image, and the Kafka
+# imagePullPolicy: Never on the maintenance CronJobs / Connect pod then uses
+# these local images. Two images: the Spark maintenance image, and the Kafka
 # Connect worker image (Iceberg sink + JSON Schema converter) for ingest.
 eval "$(minikube docker-env)"
 docker build -t "${IMAGE}" --build-arg APP_VERSION="${APP_VERSION}" .
@@ -49,20 +47,12 @@ eval "$(minikube docker-env -u)"
 echo "==> namespace"
 kubectl apply -f k8s/namespace.yaml
 
-echo "==> Flink Kubernetes Operator ${OPERATOR_VERSION}"
-helm repo add flink-operator \
-  "https://downloads.apache.org/flink/flink-kubernetes-operator-${OPERATOR_VERSION}/" >/dev/null 2>&1 || true
-helm repo update flink-operator >/dev/null
-# webhook.create=false avoids the cert-manager dependency (the webhook only
-# does validation/defaulting); rbac.create + watchNamespaces makes the chart
-# create the `flink` ServiceAccount + RBAC the JobManagers need in $NS.
-helm upgrade --install flink-kubernetes-operator \
-  flink-operator/flink-kubernetes-operator \
-  --version "${OPERATOR_VERSION}" \
-  --namespace "${NS}" \
-  --set watchNamespaces="{${NS}}" \
-  --set webhook.create=false
-kubectl -n "${NS}" rollout status deploy/flink-kubernetes-operator --timeout=180s
+echo "==> remove legacy Flink maintenance resources if present"
+kubectl -n "${NS}" delete flinkdeployment maintenance orphan-gc --ignore-not-found 2>/dev/null || true
+helm uninstall flink-kubernetes-operator -n "${NS}" --ignore-not-found 2>/dev/null || true
+kubectl -n "${NS}" delete rolebinding flink-role-binding --ignore-not-found
+kubectl -n "${NS}" delete role flink --ignore-not-found
+kubectl -n "${NS}" delete serviceaccount flink --ignore-not-found
 
 echo "==> datagen ConfigMap (from scripts/datagen.sh — single source of truth)"
 kubectl -n "${NS}" create configmap datagen-script \
@@ -78,6 +68,7 @@ done
 echo "==> ingest: schema registry + kafka connect (Iceberg sink)"
 kubectl apply -f k8s/schema-registry.yaml -f k8s/kafka-connect.yaml
 kubectl -n "${NS}" set image deployment/kafka-connect kafka-connect="${CONNECT_IMAGE}"
+kubectl -n "${NS}" rollout restart deployment/kafka-connect
 for d in schema-registry kafka-connect; do
   kubectl -n "${NS}" rollout status deploy/"$d" --timeout=300s
 done
@@ -92,16 +83,13 @@ kubectl -n "${NS}" wait --for=condition=complete job/connector-setup --timeout=1
 echo "==> datagen (JSON Schema producer, phased v1 -> v2 evolution)"
 kubectl apply -f k8s/datagen.yaml
 
-echo "==> Flink Application clusters (maintenance + orphan-gc)"
-kubectl apply -f k8s/flink-maintenance.yaml -f k8s/flink-orphan-gc.yaml
-
-echo "==> maintenance CronJobs (wake the suspended maintenance/orphan-gc clusters on schedule)"
+echo "==> Spark maintenance CronJobs"
 kubectl apply -f k8s/maintenance-cron.yaml
 
 cat <<EOF
 
 Deployed. Watch it come up:
-  kubectl -n ${NS} get flinkdeployment,pods
+  kubectl -n ${NS} get pods,cronjob
   kubectl -n ${NS} logs deploy/datagen -f      # watch v1 -> v2 schema evolution
 
 Ingest runs continuously on Kafka Connect (the Iceberg sink connector):
@@ -109,18 +97,14 @@ Ingest runs continuously on Kafka Connect (the Iceberg sink connector):
   curl -s localhost:8083/connectors/iceberg-sink/status | jq      # RUNNING?
   curl -s localhost:8081/subjects                                 # registered schemas (via SR port-forward below)
 
-The maintenance + orphan-gc Flink clusters ship SUSPENDED and only have
-JM/TM pods during a cron-triggered wake window. Cron schedule + wake length
-live in k8s/maintenance-cron.yaml.
+The maintenance + orphan-gc Spark jobs run as short-lived CronJob pods.
+Cron schedules live in k8s/maintenance-cron.yaml.
 
   kubectl -n ${NS} get cronjob
-  kubectl -n ${NS} get jobs   # one Job per cron firing; pod logs the wake
-  # Force a wake now (any of the two), e.g. for the maintenance cluster:
+  kubectl -n ${NS} get jobs   # one Job per cron firing
+  # Force a maintenance run now:
   kubectl -n ${NS} create job --from=cronjob/maintenance-runner maintenance-now
 
-Flink UIs (maintenance/orphan-gc UIs only respond mid-wake):
-  kubectl -n ${NS} port-forward svc/maintenance-rest 8082:8081   # maintenance (rewrite+expire)
-  kubectl -n ${NS} port-forward svc/orphan-gc-rest 8084:8081     # orphan GC
 Schema Registry / MinIO console:
   kubectl -n ${NS} port-forward svc/schema-registry 8081:8081    # JSON Schemas
   kubectl -n ${NS} port-forward svc/minio 9001:9001              # admin/password

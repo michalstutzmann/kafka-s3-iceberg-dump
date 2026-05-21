@@ -3,7 +3,7 @@
 # so re-running (or a Job restart) just reapplies the same config.
 #
 # This is where the ingest topology actually lives — catalog wiring mirrors
-# IcebergCatalog.fromEnv() so the connector and the Flink maintenance jobs
+# IcebergCatalog.fromEnv() so the connector and the Spark maintenance jobs
 # share one JDBC-catalog-on-Postgres table (db.events) on MinIO. The connector
 # OWNS the table: auto-create + evolve-schema mean the schema comes from the
 # JSON Schemas datagen registers, not from any hardcoded Java/SQL definition.
