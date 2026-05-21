@@ -4,21 +4,33 @@ Guidance for AI agents working in this repository.
 
 ## What this is
 
-**Kafka S3 Iceberg Dump** — a demo Apache Flink (Java) app that streams JSON
-events from Kafka into an Apache Iceberg table on S3 (MinIO), with Iceberg
-**table maintenance** running as separate jobs. **Three** independent Flink
-Application-Mode clusters (Flink Kubernetes Operator): `ingest`
-(`KafkaToIcebergJob`), `maintenance` (`IcebergMaintenanceJob` =
-`RewriteDataFiles` + `ExpireSnapshots`) and `orphan-gc`
-(`IcebergOrphanGcJob` = `DeleteOrphanFiles`). Each gets its own
-JobManager+TaskManager (isolated memory/CPU + failure domain). `maintenance`
-and `orphan-gc` share the **same** Postgres maintenance lock id
-(`db.events`), so the lock serialises orphan GC against expire/rewrite.
-Ingest runs continuously; the two maintenance clusters ship SUSPENDED and
-are woken on a schedule by Kubernetes `CronJob`s (see
-[`k8s/maintenance-cron.yaml`](k8s/maintenance-cron.yaml)) — outside their
-wake windows they have zero JM/TM pods. The whole stack runs on **minikube**
-(`scripts/minikube-up.sh`).
+**Kafka S3 Iceberg Dump** — a demo that streams JSON events from Kafka into an
+Apache Iceberg table on S3 (MinIO), with Iceberg **table maintenance** running
+as separate Flink jobs. Two runtimes, deliberately split:
+
+* **Ingest = Apache Iceberg Kafka Connect sink connector** (not Flink). A
+  single Kafka Connect worker (`k8s/kafka-connect.yaml`) runs the
+  `org.apache.iceberg.connect.IcebergSinkConnector`, registered by the
+  `connector-setup` Job (`k8s/connector-setup.yaml`). Records are produced as
+  **JSON Schema** through **Confluent Schema Registry**
+  (`k8s/schema-registry.yaml`); the connector's `JsonSchemaConverter` maps the
+  registry schema to Iceberg types, and **owns the table** —
+  `auto-create-enabled` + `evolve-schema-enabled` mean it creates `db.events`
+  and ALTERs it as the schema evolves. There is **no hardcoded Iceberg schema
+  in Java** anymore.
+* **Maintenance = two Flink Application-Mode clusters** (Flink Kubernetes
+  Operator): `maintenance` (`IcebergMaintenanceJob` = `RewriteDataFiles` +
+  `ExpireSnapshots`) and `orphan-gc` (`IcebergOrphanGcJob` =
+  `DeleteOrphanFiles`). Each gets its own JobManager+TaskManager (isolated
+  memory/CPU + failure domain). They share the **same** Postgres maintenance
+  lock id (`db.events`), so the lock serialises orphan GC against
+  expire/rewrite. Both ship SUSPENDED and are woken on a schedule by
+  Kubernetes `CronJob`s (see [`k8s/maintenance-cron.yaml`](k8s/maintenance-cron.yaml))
+  — outside their wake windows they have zero JM/TM pods.
+
+Ingest (Kafka Connect) runs continuously. The Flink jobs and the Kafka Connect
+ingest **share one Iceberg JDBC-catalog-on-Postgres table** (`db.events`) on
+MinIO. The whole stack runs on **minikube** (`scripts/minikube-up.sh`).
 
 ## Build & run
 
@@ -29,49 +41,69 @@ scripts/minikube-down.sh            # delete the whole minikube profile
 scripts/minikube-down.sh --keep-cluster   # only remove the app + operator
 ```
 
-* No local JDK/Maven required for the minikube path — the multi-stage
-  `Dockerfile` compiles the jar in a `maven:3.9.9-eclipse-temurin-21` stage,
-  then bakes it into a `flink:2.0.2-java21` image at `/opt/flink/usrlib`. The
-  image is built **inside minikube's docker** (no registry); FlinkDeployments
-  use `imagePullPolicy: Never`.
+* No local JDK/Maven required for the minikube path. **Two images** are built
+  **inside minikube's docker** (no registry; consumers use
+  `imagePullPolicy: Never`):
+  - `Dockerfile` → `s3-table-dump:dev`: multi-stage, compiles the Flink
+    maintenance jar in a `maven:3.9.9-eclipse-temurin-21` stage, then bakes it
+    into a `flink:2.0.2-java21` image at `/opt/flink/usrlib`.
+  - `Dockerfile.connect` → `s3-table-dump-connect:dev`: assembles the Iceberg
+    Kafka Connect plugin (via `kafka-connect/pom.xml`, `dependency:copy-dependencies`)
+    onto `confluentinc/cp-kafka-connect`, plus the Confluent JSON Schema
+    converter.
 * Local builds use Java 21 (`maven.compiler.release=21`).
 * There are **no automated tests**; verify by running the stack (see README
   "Verify it works"): `kubectl -n s3-table-dump get flinkdeployment,pods`,
-  port-forward `svc/ingest-rest` / `svc/maintenance-rest` (separate Flink UIs
-  — one per cluster), MinIO console (`svc/minio` :9001, admin/password), and
-  the maintenance TaskManager pod logs.
+  the connector status (`curl svc/kafka-connect:8083/connectors/iceberg-sink/status`),
+  the registered schemas (`svc/schema-registry` :8081 `/subjects`),
+  `svc/maintenance-rest` (Flink UI, mid-wake only), MinIO console
+  (`svc/minio` :9001, admin/password), and the maintenance TaskManager logs.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `src/main/java/.../IcebergCatalog.java` | shared: `SCHEMA`/`SPEC`, env-driven catalog config, idempotent `ensureTable`, `JdbcLockFactory` |
-| `src/main/java/.../KafkaToIcebergJob.java` | ingest job (jar manifest main class): Kafka source → `IcebergSink` |
-| `src/main/java/.../IcebergMaintenanceJob.java` | maintenance job: `RewriteDataFiles` + `ExpireSnapshots` |
+| `src/main/java/.../IcebergCatalog.java` | shared (maintenance jobs): env-driven catalog config + `JdbcLockFactory`. **No** `SCHEMA`/`ensureTable` — the connector owns the table |
+| `src/main/java/.../IcebergMaintenanceJob.java` | maintenance job (jar manifest main class): `RewriteDataFiles` + `ExpireSnapshots` |
 | `src/main/java/.../IcebergOrphanGcJob.java` | orphan-GC job: `DeleteOrphanFiles` only, shares the `db.events` lock id |
-| `src/main/java/.../JsonToRowData.java` | JSON → Iceberg `RowData` mapper |
 | `src/main/java/.../RetryingTriggerLockFactory.java` | retries `TriggerLockFactory.open()` on the TM (absorbs JDBC cold-connect race) |
-| `pom.xml` | deps + `maven-shade-plugin` (fat jar, `ServicesResourceTransformer`) |
+| `pom.xml` | Flink maintenance jar: deps + `maven-shade-plugin` (fat jar, `ServicesResourceTransformer`) |
 | `Dockerfile` | multi-stage: Maven build → Flink 2.0 image with jar in `usrlib` |
-| `k8s/` | `namespace`, `postgres`, `minio`, `kafka`, `datagen`, the three `FlinkDeployment`s (`flink-ingest.yaml`, `flink-maintenance.yaml`, `flink-orphan-gc.yaml`), and `maintenance-cron.yaml` (RBAC + two `CronJob`s that wake the suspended maintenance/orphan-gc clusters) |
-| `scripts/minikube-up.sh` / `minikube-down.sh` | bring up / tear down on minikube (image build, operator, infra, apps) |
-| `scripts/datagen.sh` | POSIX-sh JSON generator, piped into `kafka-console-producer` (no kcat) |
+| `kafka-connect/pom.xml` | build-only: gathers the Iceberg connector + AWS/Postgres/Hadoop deps into a Connect plugin dir (`dependency:copy-dependencies`) |
+| `Dockerfile.connect` | `cp-kafka-connect` + the assembled Iceberg plugin + Confluent JSON Schema converter |
+| `k8s/` | `namespace`, `postgres`, `minio`, `kafka`, `schema-registry`, `kafka-connect` (ingest worker), `connector-setup` (registers the sink connector), `datagen`, the two maintenance `FlinkDeployment`s (`flink-maintenance.yaml`, `flink-orphan-gc.yaml`), and `maintenance-cron.yaml` (RBAC + two `CronJob`s that wake the suspended clusters) |
+| `scripts/minikube-up.sh` / `minikube-down.sh` | bring up / tear down on minikube (build both images, operator, infra, ingest, maintenance) |
+| `scripts/datagen.sh` | bash JSON-Schema generator via `kafka-json-schema-console-producer`; phased v1→v2 to demo schema evolution |
 
 ## Architecture invariants — do not break
 
-* **Flink is pinned to the 2.0 line.** Iceberg ships a Flink connector only
-  for Flink 2.0 (`iceberg-flink-runtime-2.0`). Do **not** bump `flink.version`
-  past `2.0.x` unless a matching `iceberg-flink-runtime-<newer>` exists.
-  Versions are cross-checked in `pom.xml` properties.
-* **Three jobs, one image, three clusters.** `KafkaToIcebergJob` (ingest,
-  the jar's manifest main class), `IcebergMaintenanceJob` (rewrite+expire) and
-  `IcebergOrphanGcJob` (orphan GC) ship in the *same* image and run as
-  *separate Flink Application-Mode clusters* (one `FlinkDeployment` each, the
-  class set via `entryClass`). Shared schema/catalog/lock wiring lives in
-  `IcebergCatalog`; keep it the single source of truth — don't duplicate
-  catalog props or `SCHEMA` into the job classes. The split is **physical**:
-  each job has its own JM+TM pods and memory/CPU budget (resource isolation —
-  the point; don't merge them back into a session cluster).
+* **Flink (maintenance) is pinned to the 2.0 line; the connector to Iceberg
+  1.10.2.** Iceberg ships a Flink connector only for Flink 2.0
+  (`iceberg-flink-runtime-2.0`). Do **not** bump `flink.version` past `2.0.x`
+  unless a matching `iceberg-flink-runtime-<newer>` exists. The Kafka Connect
+  plugin (`kafka-connect/pom.xml`) uses `iceberg-kafka-connect` at the **same**
+  `iceberg.version` (1.10.2) as the Flink jobs — keep the two `iceberg.version`
+  properties in lockstep so ingest and maintenance run against one Iceberg
+  line. Versions are cross-checked in `pom.xml` / `kafka-connect/pom.xml`.
+* **Ingest is Kafka Connect; maintenance is two Flink clusters.** The two Flink
+  jobs — `IcebergMaintenanceJob` (rewrite+expire, the jar's manifest main
+  class) and `IcebergOrphanGcJob` (orphan GC) — ship in the *same* image and
+  run as *separate Flink Application-Mode clusters* (one `FlinkDeployment`
+  each, class via `entryClass`); shared catalog/lock wiring lives in
+  `IcebergCatalog` (single source of truth — don't duplicate catalog props
+  into the job classes). The split is **physical**: own JM+TM pods and
+  memory/CPU budget. **Ingest does not run on Flink** — don't reintroduce a
+  Flink ingest job; it lives in the Kafka Connect sink connector (configured
+  in `k8s/connector-setup.yaml`).
+* **The connector owns the table schema — don't put it back in Java.** The
+  sink runs with `iceberg.tables.auto-create-enabled` +
+  `iceberg.tables.evolve-schema-enabled`, so it creates `db.events` (and the
+  `db` namespace — `IcebergWriterFactory.createNamespaceIfNotExist`) and ALTERs
+  it from the registered JSON Schema. There is intentionally **no** Java
+  `SCHEMA`/`SPEC`/`ensureTable` and **no** JSON→RowData mapper. Partitioning
+  (`identity(event_type)`) is set via `iceberg.tables.default-partition-by`.
+  Don't reintroduce a hardcoded schema or a lockstep mapper "to be safe" — it
+  defeats the whole point of registry-driven mapping/evolution.
 * **Maintenance clusters are cron-driven, not continuous.** `maintenance`
   and `orphan-gc` ship with `spec.job.state: suspended` and
   `upgradeMode: stateless`. The CronJobs in `k8s/maintenance-cron.yaml`
@@ -102,41 +134,96 @@ scripts/minikube-down.sh --keep-cluster   # only remove the app + operator
   that reintroduces the in-graph delete race. Iceberg 1.10.2's Flink API
   *does* include `DeleteOrphanFiles`; don't claim orphan removal needs
   another engine.
-* **Catalog = Iceberg JDBC catalog on Postgres**; the *same* Postgres backs the
-  maintenance `JdbcLockFactory` (`IcebergCatalog.lockFactory()`), so the lock
-  holds across both separately-deployed jobs. Storage = MinIO via `S3FileIO`
-  (path-style). All connection settings are **environment-variable driven**
-  with container-friendly defaults (see `IcebergCatalog.fromEnv`). Keep new
-  config env-driven; don't hardcode hosts.
-* **`JsonToRowData` field order must match `IcebergCatalog.SCHEMA`** exactly
-  (id, event_type, user_id, amount, event_time). Changing the schema means
-  changing both, in lockstep.
-* **Checkpointing must stay enabled in all three jobs** — the ingest
-  Iceberg sink commits on checkpoint (without it nothing is written); the
-  maintenance jobs' `TableMaintenance` source checkpoints its
-  processed-snapshot cursor. With cron-driven wakes + `upgradeMode:
-  stateless` that cursor is deliberately discarded between wakes (each wake
-  is a cold start — that's why we use commit-count over the table's
-  all-time history rather than since-job-start), but checkpointing still
-  has to be on for the source to operate during a wake.
-* `hadoop-client-api/runtime` are bundled deliberately: Iceberg's
-  `CatalogLoader` needs `org.apache.hadoop.conf.Configuration` on the classpath
-  even with `S3FileIO`. Don't remove them.
-* **Application Mode** runs each job's `main()` in its **JobManager pod** (no
-  separate submitter/client), so `IcebergCatalog.awaitJdbc()` /
-  `ensureTable()` run there and the JM pod needs network access to Postgres +
-  MinIO (in-cluster Services `postgres`/`minio`). `ensureTable()` is
-  idempotent and swallows `AlreadyExistsException`, so the two clusters can
-  come up in any order — there is no submit-ordering dependency to preserve.
+* **One catalog, two writers.** Catalog = Iceberg **JDBC catalog on Postgres**;
+  storage = MinIO via `S3FileIO` (path-style). The Kafka Connect sink's
+  `iceberg.catalog.*` properties (`k8s/connector-setup.yaml`) and the Flink
+  jobs' `IcebergCatalog.fromEnv()` must describe the **same** catalog/warehouse
+  so both write `db.events`. The *same* Postgres also backs the maintenance
+  `JdbcLockFactory` (`IcebergCatalog.lockFactory()`). All Flink-side connection
+  settings are **environment-variable driven** with container-friendly
+  defaults; keep them env-driven and keep them matching the connector config.
+* **Schema mapping flows registry → connector → table; `event_time` is the
+  one subtlety.** Field types come from the JSON Schema datagen registers:
+  string→string, `{"type":"number"}`→double. `event_time` is declared as the
+  **Kafka Connect `Timestamp` logical type** in JSON Schema
+  (`{"type":"number","title":"org.apache.kafka.connect.data.Timestamp","connect.type":"int64"}`),
+  which the connector maps to Iceberg **`timestamptz`** (`SchemaUtils` →
+  `TimestampType.withZone()`). Because of that, its on-the-wire value must be
+  **epoch milliseconds (a number)**, not an ISO string — see
+  `scripts/datagen.sh`. Schema *evolution* requires the new JSON Schema to be
+  registry-compatible (default BACKWARD), and two non-obvious JSON-Schema rules
+  the demo schemas depend on (both **verified** against the running registry):
+  (1) both schemas use a **closed content model** (`"additionalProperties":
+  false`) — adding a property to an *open* model is rejected as
+  `PROPERTY_ADDED_TO_OPEN_CONTENT_MODEL` (old data could already carry a
+  differently-typed field), so the v2 add validates *only* because the model is
+  closed; (2) the new `currency` field is **optional** (not in `required`).
+  Change either and registration fails and the table won't evolve.
+* **Checkpointing must stay enabled in both Flink maintenance jobs** — their
+  `TableMaintenance` source checkpoints its processed-snapshot cursor. With
+  cron-driven wakes + `upgradeMode: stateless` that cursor is deliberately
+  discarded between wakes (each wake is a cold start — that's why we use
+  commit-count over the table's all-time history rather than
+  since-job-start), but checkpointing still has to be on for the source to
+  operate during a wake. (Ingest commit cadence is the connector's
+  `iceberg.control.commit.interval-ms`, not a Flink checkpoint.)
+* `hadoop-client-api/runtime` are bundled deliberately **on both sides** (Flink
+  jar *and* the Connect plugin in `kafka-connect/pom.xml`): Iceberg's catalog
+  loading needs `org.apache.hadoop.conf.Configuration` on the classpath even
+  with `S3FileIO`. Don't remove them. Likewise the Postgres JDBC driver is not
+  in the connector distribution — `kafka-connect/pom.xml` adds it.
+* **Application Mode** runs each Flink job's `main()` in its **JobManager pod**
+  (no separate submitter/client), so `IcebergCatalog.awaitJdbc()` runs there
+  and the JM pod needs network access to Postgres + MinIO. The maintenance jobs
+  **no longer create the table** (the connector does) — they just `tableLoader`
+  it. A maintenance wake that fires before the connector's first commit fails
+  to load the table and retries on the next cron wake; by then ingest has
+  created it. No submit-ordering dependency to preserve.
 
 ## Gotchas
 
-* Only the ingest cluster runs continuously. `maintenance` and `orphan-gc`
-  pods exist only inside a cron-triggered wake window (default 240 s;
-  `sleep` value in `k8s/maintenance-cron.yaml`). Outside that window
-  `kubectl get pods` will show no JM/TM for those two clusters — that's the
-  point, not a failure. To verify wake plumbing without waiting for cron,
+* Ingest (the `kafka-connect` Deployment) runs continuously. `maintenance` and
+  `orphan-gc` Flink pods exist only inside a cron-triggered wake window
+  (default 240 s; `sleep` value in `k8s/maintenance-cron.yaml`). Outside that
+  window `kubectl get pods` will show no JM/TM for those two clusters — that's
+  the point, not a failure. To verify wake plumbing without waiting for cron,
   force a run: `kubectl -n s3-table-dump create job --from=cronjob/maintenance-runner maintenance-now`.
+* **CP images need `enableServiceLinks: false`** (set on the schema-registry
+  pod). A Service named `schema-registry` makes Kubernetes inject service-link
+  env vars (`SCHEMA_REGISTRY_PORT=tcp://<clusterIP>:8081`, …) into pods; CP's
+  entrypoint reads every `SCHEMA_REGISTRY_*` var as config, parses the
+  `tcp://…` value as the deprecated `port`, and the container exits 1 on
+  startup (CrashLoopBackOff, logs stop right after "Configuring …"). Verified
+  fix; don't remove it. (kafka-connect reads `CONNECT_*`, not the injected
+  vars, so it's unaffected.)
+* **The connector plugin must include `iceberg-aws` AND `iceberg-parquet`**
+  (see `kafka-connect/pom.xml`). `iceberg-kafka-connect` does not pull them
+  transitively — the Flink runtime *uber jar* shades them in, but the manually
+  assembled Connect plugin doesn't, so the task fails at runtime with
+  `ClassNotFoundException: org.apache.iceberg.aws.s3.S3FileIO` (FileIO) or
+  `NoClassDefFoundError: org/apache/iceberg/parquet/Parquet` (default write
+  format). `iceberg-aws-bundle` ships only the AWS SDK, not the
+  `org.apache.iceberg.aws.*` classes — both deps are needed.
+* The connector is registered by the `connector-setup` **Job**, not by the
+  worker itself. If ingest isn't writing, check that order: worker
+  `Running` → Job completed → `curl kafka-connect:8083/connectors/iceberg-sink/status`
+  shows `RUNNING`. The Job waits for both Connect and Schema Registry REST
+  before `PUT`ting, and the `PUT …/config` form is idempotent (re-run safe).
+  `scripts/minikube-up.sh` deletes+reapplies the Job each run because Job specs
+  are largely immutable.
+* The control topic (`control-iceberg`) and the Connect internal topics rely on
+  the broker's `auto.create.topics.enable` (apache/kafka default = true) and
+  the `CONNECT_*_REPLICATION_FACTOR: "1"` env on the single-broker demo. The
+  sink uses exactly-once (KIP-447), fine on Kafka 4.0.
+* Schema **evolution won't happen** if the v2 schema isn't registry-compatible
+  (default BACKWARD). For JSON Schema specifically that means the schemas must
+  be a **closed content model** and the added field **optional** (see the
+  schema-mapping invariant above). A required new field, a type change, a
+  rename, or adding a field to an *open* model is rejected at registration
+  (datagen logs the producer error, exits non-zero, and the Deployment
+  crash-loops re-running phase 1) and the table won't evolve. Correct registry
+  behaviour, not a bug — but it does take the datagen pod down, so a crash-
+  looping datagen is the signal the v2 schema isn't compatible.
 * The cluster still needs real RAM during a wake — and a wake can overlap
   with ingest. `scripts/minikube-up.sh` starts minikube with `--memory=7600`
   (override `MINIKUBE_MEMORY`). Per-cluster JM/TM `resource` is tuned lean
@@ -188,8 +275,15 @@ scripts/minikube-down.sh --keep-cluster   # only remove the app + operator
   cluster; for a clean run use `scripts/minikube-down.sh` then
   `scripts/minikube-up.sh`.
 * All image tags, the Flink Kubernetes Operator version (`OPERATOR_VERSION`
-  in `scripts/minikube-up.sh`) **and** `pom.xml` deps/plugins are pinned —
-  keep them pinned (no `latest`/floating tags). MinIO archived its own Docker
+  in `scripts/minikube-up.sh`) **and** `pom.xml` / `kafka-connect/pom.xml`
+  deps/plugins are pinned — keep them pinned (no `latest`/floating tags). The
+  Confluent images (`cp-schema-registry`, `cp-kafka-connect`) and the
+  `confluent-hub install …:8.2.1` converter are pinned to **CP 8.2.1** (Kafka
+  4.x line, matches the apache/kafka 4.0 broker); bump the image tags and the
+  converter version **together**. NOTE: the `cp-*` images are under the
+  **Confluent Community License** (free, source-available, not OSI
+  "open source") — a different license from the Apache-2.0 broker; acceptable
+  for this demo. MinIO archived its own Docker
   Hub repo in 2025: everything MinIO uses the maintained `alpine/minio`
   rebuild (needs `runAsUser: 0` — it runs as uid 100 by default and can't
   write the `emptyDir`). `alpine/minio` has no `mc`; the **`bucket-setup`
@@ -203,13 +297,15 @@ scripts/minikube-down.sh --keep-cluster   # only remove the app + operator
 
 * Java: standard Flink/Iceberg DataStream API; keep operators named
   (`.name(...)`) for readability in the Flink UI.
-* Tuning knobs live in code, not SQL: rewrite/expire in
-  `IcebergMaintenanceJob`, orphan GC in `IcebergOrphanGcJob`, ingest (Kafka
-  source, checkpoint interval) in `KafkaToIcebergJob`. Cron schedule + wake
-  duration for the maintenance clusters live in `k8s/maintenance-cron.yaml`
-  (`schedule:` + the `sleep` value).
-  `DeleteOrphanFiles.minAge` must stay comfortably above the ingest commit
-  cadence or in-flight files get deleted.
+* Tuning knobs: rewrite/expire in `IcebergMaintenanceJob`, orphan GC in
+  `IcebergOrphanGcJob` (Java, not SQL). Ingest tuning is **connector config**
+  in `k8s/connector-setup.yaml` (commit interval, partitioning, auto-create /
+  evolve flags) and the producer in `scripts/datagen.sh` (event shape, the
+  JSON Schemas, phase-1 count). Cron schedule + wake duration for the
+  maintenance clusters live in `k8s/maintenance-cron.yaml` (`schedule:` + the
+  `sleep` value). `DeleteOrphanFiles.minAge` must stay comfortably above the
+  connector's commit cadence (`iceberg.control.commit.interval-ms`) or
+  in-flight files get deleted.
 * Keep README's stack table and version constraints in sync with `pom.xml`.
 * Releases are tagged with
   [git-semver-release](https://github.com/michalstutzmann/git-semver-release)

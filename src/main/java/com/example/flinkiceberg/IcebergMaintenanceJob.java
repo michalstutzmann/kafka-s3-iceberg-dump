@@ -25,11 +25,12 @@ import org.apache.iceberg.flink.maintenance.api.TriggerLockFactory;
  * lock ({@link IcebergCatalog#lockFactory()}, lock id {@code db.events}), so
  * the lock serialises orphan GC against this job's rewrite/expire cycles.
  *
- * <p>Deployed separately from {@link KafkaToIcebergJob} so maintenance and
+ * <p>Deployed separately from the Kafka Connect ingest sink so maintenance and
  * ingest have independent lifecycles, failure domains and resource budgets.
  * The Postgres-backed {@link TriggerLockFactory} from {@link IcebergCatalog}
- * coordinates this job with {@link IcebergOrphanGcJob}; ingest writes do not
- * use this maintenance lock and rely on Iceberg's optimistic commits.
+ * coordinates this job with {@link IcebergOrphanGcJob}; the connector's ingest
+ * writes do not use this maintenance lock and rely on Iceberg's optimistic
+ * commits.
  */
 public final class IcebergMaintenanceJob {
 
@@ -41,9 +42,10 @@ public final class IcebergMaintenanceJob {
     // genuinely down. The TaskManager cold-connect race is absorbed in-place
     // by RetryingTriggerLockFactory (see IcebergCatalog.lockFactory()).
     catalog.awaitJdbc(30, Duration.ofSeconds(2));
-    // Idempotent and race-tolerant: whichever of the ingest/maintenance jobs
-    // is deployed first creates the table; the other just loads it.
-    catalog.ensureTable();
+    // The table is created and schema-evolved by the Kafka Connect ingest
+    // sink (auto-create + evolve-schema); this job only loads it. If a wake
+    // fires before the connector has written its first commit the load fails
+    // and the next cron wake retries — by then ingest has created the table.
     TableLoader tableLoader = catalog.tableLoader();
 
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();

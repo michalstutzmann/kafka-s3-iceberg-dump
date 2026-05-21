@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Build-only helper POM. It does NOT produce the app jar (that is the root
+  pom.xml, the Flink maintenance jobs) and is NOT published anywhere — its sole
+  job is to gather the Apache Iceberg Kafka Connect sink connector and the
+  dependencies it needs (S3FileIO/AWS, Postgres JDBC driver, Hadoop) into one
+  directory that becomes a Kafka Connect plugin (see Dockerfile.connect).
+
+  The all-in-one connector distribution zip is built from Iceberg source and is
+  not on Maven Central, but the `iceberg-kafka-connect` artifact IS, so we let
+  Maven resolve it transitively and copy the result with
+  `mvn -f kafka-connect/pom.xml dependency:copy-dependencies`.
+
+  Versions are pinned and kept in lockstep with the root pom.xml
+  (iceberg.version, hadoop.version) so the connector and the Flink maintenance
+  jobs run against the same Iceberg line. The <version> here is a build-only
+  placeholder (this artifact is never installed/released).
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example</groupId>
+  <artifactId>iceberg-connect-plugin</artifactId>
+  <version>0.0.0-PLUGIN</version>
+  <packaging>pom</packaging>
+  <name>Iceberg Kafka Connect plugin assembly</name>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- keep in lockstep with ../pom.xml -->
+    <iceberg.version>1.10.2</iceberg.version>
+    <hadoop.version>3.4.1</hadoop.version>
+    <postgresql.version>42.7.4</postgresql.version>
+  </properties>
+
+  <dependencies>
+    <!-- The Iceberg Kafka Connect sink connector itself; pulls iceberg-core /
+         iceberg-api / iceberg-common transitively. connect-api is provided by
+         the Kafka Connect runtime, so it is not bundled. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-kafka-connect</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+
+    <!-- Iceberg's AWS integration: the org.apache.iceberg.aws.* classes,
+         including S3FileIO. REQUIRED and separate from the bundle below — the
+         Flink runtime jar shades these in, but the Kafka Connect plugin must
+         add iceberg-aws explicitly or the connector fails at startup with
+         ClassNotFoundException: org.apache.iceberg.aws.s3.S3FileIO. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+    <!-- The shaded AWS SDK v2 that iceberg-aws needs at runtime (S3 client,
+         http client). The bundle ships the SDK only, NOT the iceberg-aws
+         classes — hence both deps. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws-bundle</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+
+    <!-- Parquet write path: org.apache.iceberg.parquet.Parquet. Iceberg's
+         default write format is Parquet and the connector writes via
+         GenericAppenderFactory, which needs this module. Like iceberg-aws it
+         is shaded into the Flink runtime jar but NOT pulled transitively by
+         iceberg-kafka-connect, so the connector hits
+         NoClassDefFoundError: org/apache/iceberg/parquet/Parquet without it.
+         (iceberg-data + parquet-hadoop already arrive transitively.) -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-parquet</artifactId>
+      <version>${iceberg.version}</version>
+    </dependency>
+
+    <!-- JDBC catalog driver: NOT included in the connector distribution
+         ("JDBC drivers are not included… you will need to include those"). -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>${postgresql.version}</version>
+    </dependency>
+
+    <!-- Iceberg's catalog loading needs org.apache.hadoop.conf.Configuration on
+         the classpath even with S3FileIO (same reason as the Flink image);
+         the shaded Hadoop client uber jars are conflict-free. -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-api</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-runtime</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- `dependency:copy-dependencies` writes every (transitive) dependency
+           jar into target/plugin; Dockerfile.connect copies that into the
+           Kafka Connect plugin.path. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.8.1</version>
+        <configuration>
+          <outputDirectory>${project.build.directory}/plugin</outputDirectory>
+          <includeScope>runtime</includeScope>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -52,8 +52,9 @@ public final class IcebergOrphanGcJob {
     // Fail-fast pre-flight; the TaskManager cold-connect race is absorbed
     // in-place by RetryingTriggerLockFactory (see IcebergCatalog.lockFactory()).
     catalog.awaitJdbc(30, Duration.ofSeconds(2));
-    // Idempotent and race-tolerant: any of the jobs may be deployed first.
-    catalog.ensureTable();
+    // The table is created by the Kafka Connect ingest sink (auto-create);
+    // this job only loads it. An early wake before the connector's first
+    // commit fails and retries on the next cron wake.
     TableLoader tableLoader = catalog.tableLoader();
 
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();

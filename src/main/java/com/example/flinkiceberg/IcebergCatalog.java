@@ -1,7 +1,5 @@
 package com.example.flinkiceberg;
 
-import java.io.Closeable;
-import java.io.IOException;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.time.Duration;
@@ -11,52 +9,36 @@ import java.util.Properties;
 
 import org.apache.hadoop.conf.Configuration;
 
-import org.apache.iceberg.PartitionSpec;
-import org.apache.iceberg.Schema;
-import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.catalog.Namespace;
-import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.flink.CatalogLoader;
 import org.apache.iceberg.flink.TableLoader;
 import org.apache.iceberg.flink.maintenance.api.JdbcLockFactory;
 import org.apache.iceberg.flink.maintenance.api.TriggerLockFactory;
-import org.apache.iceberg.types.Types;
 
 /**
- * Shared Iceberg catalog/table wiring used by all three Flink jobs in this
- * demo: the {@link KafkaToIcebergJob} ingest job, the
- * {@link IcebergMaintenanceJob} (rewrite + expire) and the
+ * Shared Iceberg catalog/lock wiring used by the two Flink <b>maintenance</b>
+ * jobs in this demo: {@link IcebergMaintenanceJob} (rewrite + expire) and
  * {@link IcebergOrphanGcJob} (orphan-file removal).
  *
- * <p>The three jobs are deployed as separate Application-Mode clusters so
- * they have independent lifecycles, failure domains and resource budgets;
- * this class keeps the parts they must agree on — schema, env-driven catalog
- * config, and the Postgres-backed maintenance lock wiring — in one place.
- * {@code maintenance} and {@code orphan-gc} share the same {@code db.events}
- * lock id, so the lock serialises orphan GC against expire/rewrite.
+ * <p>Ingestion no longer runs on Flink — it is handled by the Apache Iceberg
+ * <b>Kafka Connect</b> sink connector (see {@code k8s/kafka-connect.yaml} and
+ * {@code k8s/connector-setup.yaml}), which reads JSON-Schema records from
+ * Schema Registry and <em>owns</em> the table: it auto-creates {@code db.events}
+ * and evolves its schema from the registry. The table schema and partition spec
+ * therefore live in the connector config + the registered JSON Schema, not here.
+ *
+ * <p>The two maintenance jobs are deployed as separate Application-Mode clusters
+ * so they have independent lifecycles, failure domains and resource budgets;
+ * this class keeps the parts they must agree on — env-driven catalog config and
+ * the Postgres-backed maintenance lock wiring — in one place. Both share the
+ * same {@code db.events} lock id, so the lock serialises orphan GC against
+ * expire/rewrite.
  *
  * <p>All settings are environment-driven so the same jar runs locally and
- * inside the minikube/Application-Mode deployment.
+ * inside the minikube/Application-Mode deployment, and so they match the
+ * {@code iceberg.catalog.*} properties given to the Kafka Connect sink.
  */
 final class IcebergCatalog {
-
-  // Iceberg table schema. Field order here is the order produced by the
-  // JSON -> RowData mapper and expected by the Iceberg sink; JsonToRowData
-  // must stay in lockstep with it.
-  static final Schema SCHEMA =
-      new Schema(
-          Types.NestedField.required(1, "id", Types.StringType.get()),
-          Types.NestedField.optional(2, "event_type", Types.StringType.get()),
-          Types.NestedField.optional(3, "user_id", Types.StringType.get()),
-          Types.NestedField.optional(4, "amount", Types.DoubleType.get()),
-          Types.NestedField.optional(5, "event_time", Types.TimestampType.withZone()));
-
-  // Identity-partition by event_type so the demo produces many small data
-  // files that RewriteDataFiles can later compact.
-  static final PartitionSpec SPEC =
-      PartitionSpec.builderFor(SCHEMA).identity("event_type").build();
 
   private final String catalogUri;
   private final String jdbcUser;
@@ -183,48 +165,10 @@ final class IcebergCatalog {
   }
 
   /**
-   * Idempotently ensure the namespace and table exist. All three jobs call
-   * this so any of them can be deployed first; concurrent creation is
-   * tolerated by swallowing {@link AlreadyExistsException}. In Application
-   * Mode this runs in the JobManager pod (where {@code main()} executes).
-   */
-  void ensureTable() {
-    // org.apache.iceberg.catalog.Catalog is not AutoCloseable; close manually.
-    Catalog catalog = catalogLoader.loadCatalog();
-    try {
-      Namespace ns = Namespace.of(dbName);
-      if (catalog instanceof SupportsNamespaces nsCatalog && !nsCatalog.namespaceExists(ns)) {
-        try {
-          nsCatalog.createNamespace(ns);
-        } catch (AlreadyExistsException raced) {
-          // another job/process created it first — fine
-        }
-      }
-      if (!catalog.tableExists(tableId)) {
-        try {
-          catalog.createTable(tableId, SCHEMA, SPEC, Map.of("format-version", "2"));
-        } catch (AlreadyExistsException raced) {
-          // another job/process created it first — fine
-        }
-      }
-    } catch (Exception e) {
-      throw new IllegalStateException("Failed to ensure Iceberg table exists", e);
-    } finally {
-      if (catalog instanceof Closeable closeable) {
-        try {
-          closeable.close();
-        } catch (IOException ignored) {
-          // best-effort close of the client-side catalog
-        }
-      }
-    }
-  }
-
-  /**
    * Lock used by the maintenance graph so compaction, snapshot expiration and
    * orphan cleanup coordinate their triggers. It is backed by the *same*
-   * Postgres as the JDBC catalog. Ingest writes do not use this lock; they rely
-   * on Iceberg's normal optimistic commit protocol. JdbcLockFactory
+   * Postgres as the JDBC catalog. The Kafka Connect ingest does not use this
+   * lock; it commits via its own Iceberg-commit coordinator. JdbcLockFactory
    * auto-creates its lock table.
    *
    * <p>Wrapped in {@link RetryingTriggerLockFactory}: {@code open()} runs on
