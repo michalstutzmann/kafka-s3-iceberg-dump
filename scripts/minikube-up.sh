@@ -8,7 +8,7 @@
 #   scripts/minikube-up.sh
 #
 # Overridable via env: MINIKUBE_MEMORY, MINIKUBE_CPUS, OPERATOR_VERSION,
-# IMAGE, APP_VERSION.
+# IMAGE, CONNECT_IMAGE, APP_VERSION.
 set -euo pipefail
 
 NS=s3-table-dump
@@ -77,6 +77,7 @@ done
 
 echo "==> ingest: schema registry + kafka connect (Iceberg sink)"
 kubectl apply -f k8s/schema-registry.yaml -f k8s/kafka-connect.yaml
+kubectl -n "${NS}" set image deployment/kafka-connect kafka-connect="${CONNECT_IMAGE}"
 for d in schema-registry kafka-connect; do
   kubectl -n "${NS}" rollout status deploy/"$d" --timeout=300s
 done
@@ -86,6 +87,7 @@ echo "==> register the Iceberg sink connector"
 # Jobs are largely immutable, so recreate on re-run to pick up config changes.
 kubectl -n "${NS}" delete job connector-setup --ignore-not-found
 kubectl apply -f k8s/connector-setup.yaml
+kubectl -n "${NS}" wait --for=condition=complete job/connector-setup --timeout=180s
 
 echo "==> datagen (JSON Schema producer, phased v1 -> v2 evolution)"
 kubectl apply -f k8s/datagen.yaml
