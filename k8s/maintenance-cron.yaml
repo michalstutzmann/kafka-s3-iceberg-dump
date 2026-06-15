@@ -1,0 +1,138 @@
+# Schedules the two maintenance FlinkDeployments instead of running them
+# continuously. Each CronJob:
+#   1. patches `spec.job.state: running` on its target FlinkDeployment, which
+#      the Flink Kubernetes Operator reconciles by deploying JM+TM pods;
+#   2. sleeps for the wake window;
+#   3. patches `spec.job.state: suspended`, which scales the cluster back to
+#      zero (no JM/TM pods, no resource use).
+#
+# Why this works with `upgradeMode: stateless`: each wake is a cold start with
+# no carried trigger state. The maintenance job uses scheduleOnCommitCount,
+# which counts against the table's all-time snapshot history and fires on the
+# first source tick after wake (Iceberg's MonitorSource semantics, verified in
+# the 1.10.2 source). The orphan-gc job uses scheduleOnInterval(20s) — Iceberg
+# waits the full interval from cold start, so this interval MUST stay shorter
+# than the wake window's "useful" portion (window minus JM/TM cold-start).
+#
+# Tuning knobs:
+#   - schedule: when each pass fires.
+#   - args[-1] (the sleep): how long the cluster stays up. Sized empirically:
+#     JM+TM cold-start on minikube takes ~90 s; the maintenance graph then
+#     waits up to `max(scheduleInterval, rateLimit)` (~60 s for both jobs)
+#     before the first trigger fires; the pass itself runs in <30 s on the
+#     demo table. 240 s leaves ~60 s of margin. Shrink with care.
+#   - concurrencyPolicy: Forbid skips a tick if the previous run is still up,
+#     so two overlapping wakes can never fight over the same FlinkDeployment.
+#
+# Edge case: if the cron pod itself gets SIGKILL'd mid-sleep, the cluster is
+# left running until the next cron tick (which patches it to suspended at
+# end of run). That's a transient resource leak, not a correctness issue.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maintenance-runner
+  namespace: s3-table-dump
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maintenance-runner
+  namespace: s3-table-dump
+rules:
+  # Only flinkdeployments, only get + patch — minimum needed to flip state.
+  - apiGroups: ["flink.apache.org"]
+    resources: ["flinkdeployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maintenance-runner
+  namespace: s3-table-dump
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: maintenance-runner
+subjects:
+  - kind: ServiceAccount
+    name: maintenance-runner
+    namespace: s3-table-dump
+---
+# Rewrite + expire. Every 30 min by default; tune by editing `schedule`.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: maintenance-runner
+  namespace: s3-table-dump
+spec:
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      # Hard ceiling: a stuck kubectl shouldn't keep a pod alive forever.
+      # Sized as wake window + generous slack for the two patch calls.
+      activeDeadlineSeconds: 360
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: maintenance-runner
+          restartPolicy: Never
+          containers:
+            - name: runner
+              image: alpine/k8s:1.31.4
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  TARGET=maintenance
+                  echo "[$(date -u)] waking $TARGET"
+                  kubectl -n s3-table-dump patch flinkdeployment "$TARGET" \
+                    --type=merge -p '{"spec":{"job":{"state":"running"}}}'
+                  echo "[$(date -u)] wake window 240s"
+                  sleep 240
+                  echo "[$(date -u)] suspending $TARGET"
+                  kubectl -n s3-table-dump patch flinkdeployment "$TARGET" \
+                    --type=merge -p '{"spec":{"job":{"state":"suspended"}}}'
+                  echo "[$(date -u)] done"
+---
+# Orphan-file GC. Every 6h by default; less frequent than rewrite/expire
+# because DeleteOrphanFiles lists the whole warehouse prefix and minAge keeps
+# young files out of scope anyway.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: orphan-gc-runner
+  namespace: s3-table-dump
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 360
+      backoffLimit: 0
+      template:
+        spec:
+          serviceAccountName: maintenance-runner
+          restartPolicy: Never
+          containers:
+            - name: runner
+              image: alpine/k8s:1.31.4
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  TARGET=orphan-gc
+                  echo "[$(date -u)] waking $TARGET"
+                  kubectl -n s3-table-dump patch flinkdeployment "$TARGET" \
+                    --type=merge -p '{"spec":{"job":{"state":"running"}}}'
+                  echo "[$(date -u)] wake window 240s"
+                  sleep 240
+                  echo "[$(date -u)] suspending $TARGET"
+                  kubectl -n s3-table-dump patch flinkdeployment "$TARGET" \
+                    --type=merge -p '{"spec":{"job":{"state":"suspended"}}}'
+                  echo "[$(date -u)] done"

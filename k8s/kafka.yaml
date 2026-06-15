@@ -1,0 +1,59 @@
+# Single-node Kafka in KRaft mode (no ZooKeeper). Service name "kafka"
+# matches KAFKA_BOOTSTRAP's default (kafka:9092). Topics auto-create with
+# 3 partitions (num.partitions=3), so no separate topic-setup Job is needed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: s3-table-dump
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: kafka }
+  template:
+    metadata:
+      labels: { app: kafka }
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:4.0.0
+          env:
+            - { name: KAFKA_HEAP_OPTS, value: "-Xmx512m -Xms512m" }
+            - { name: KAFKA_NODE_ID, value: "1" }
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@localhost:9093" }
+            - { name: KAFKA_LISTENERS, value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093" }
+            - { name: KAFKA_ADVERTISED_LISTENERS, value: "PLAINTEXT://kafka:9092" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: "PLAINTEXT" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
+            - { name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0" }
+            - { name: KAFKA_NUM_PARTITIONS, value: "3" }
+          ports:
+            - { containerPort: 9092 }
+          # Native TCP probe: no in-container JVM (kafka-topics.sh spawns a
+          # full JVM per probe — slow, times out, and adds memory pressure).
+          readinessProbe:
+            tcpSocket: { port: 9092 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          # request kept below the limit so three Flink clusters + infra can
+          # still be scheduled on the tight single-node minikube; Kafka grows
+          # into the 1536Mi limit at runtime.
+          resources:
+            requests: { memory: "768Mi", cpu: "250m" }
+            limits: { memory: "1536Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: s3-table-dump
+spec:
+  selector: { app: kafka }
+  ports:
+    - { port: 9092, targetPort: 9092 }
