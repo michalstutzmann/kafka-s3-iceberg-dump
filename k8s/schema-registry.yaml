@@ -1,0 +1,62 @@
+# Confluent Schema Registry — holds the JSON Schemas the datagen producer
+# registers and the Iceberg sink connector reads to map records into the
+# table. Backs onto the same single-node Kafka (its _schemas topic). Service
+# name "schema-registry" matches the value.converter.schema.registry.url in
+# the connector config (k8s/connector-setup.yaml) and datagen's
+# schema.registry.url.
+#
+# NOTE: cp-schema-registry is under the Confluent Community License (free,
+# source-available) — a different license from the Apache-2.0 broker. Fine for
+# this demo. Pinned to CP 8.2.1 (Kafka 4.x line, matches the apache/kafka 4.0
+# broker); keep it pinned and bump alongside cp-kafka-connect in
+# Dockerfile.connect.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: schema-registry
+  namespace: s3-table-dump
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: schema-registry }
+  template:
+    metadata:
+      labels: { app: schema-registry }
+    spec:
+      # Kubernetes injects service-link env vars for every Service in the
+      # namespace, e.g. SCHEMA_REGISTRY_PORT=tcp://<clusterIP>:8081 (from this
+      # very Service). The CP entrypoint reads SCHEMA_REGISTRY_* as config, so
+      # that injected value is parsed as the (deprecated) `port` property and
+      # the container exits 1 on startup. Disabling service links removes the
+      # clash; in-cluster DNS (the `kafka`/`schema-registry` Services) is
+      # unaffected.
+      enableServiceLinks: false
+      containers:
+        - name: schema-registry
+          image: confluentinc/cp-schema-registry:8.2.1
+          env:
+            - { name: SCHEMA_REGISTRY_HOST_NAME, value: schema-registry }
+            - { name: SCHEMA_REGISTRY_LISTENERS, value: "http://0.0.0.0:8081" }
+            - { name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS, value: "PLAINTEXT://kafka:9092" }
+            # Bound the JVM so it fits the tight single-node minikube.
+            - { name: SCHEMA_REGISTRY_HEAP_OPTS, value: "-Xms256m -Xmx256m" }
+          ports:
+            - { containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /subjects, port: 8081 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests: { memory: "384Mi", cpu: "100m" }
+            limits: { memory: "768Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-registry
+  namespace: s3-table-dump
+spec:
+  selector: { app: schema-registry }
+  ports:
+    - { port: 8081, targetPort: 8081 }

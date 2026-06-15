@@ -1,0 +1,34 @@
+# Kafka Connect worker image for the Apache Iceberg sink connector — this is
+# the INGEST path. Built into
+# minikube's docker by scripts/minikube-up.sh; k8s/kafka-connect.yaml runs it
+# with imagePullPolicy: Never.
+#
+#   docker build -t s3-table-dump-connect:dev -f Dockerfile.connect .
+#
+# Two things the stock cp-kafka-connect image does not have, added here:
+#   1. The Iceberg sink connector + its deps (S3FileIO/AWS, Postgres JDBC
+#      driver, Hadoop) — assembled by kafka-connect/pom.xml. The connector's
+#      all-in-one distribution zip is built from Iceberg source (not on Maven
+#      Central), so we gather it from the published `iceberg-kafka-connect`
+#      artifact with Maven instead.
+#   2. The Confluent JSON Schema converter, used to turn Schema-Registry
+#      JSON-Schema records into Connect structs the sink can map to Iceberg.
+
+# ---- build: assemble the Iceberg connector plugin directory ----------------
+FROM maven:3.9.9-eclipse-temurin-21 AS build
+WORKDIR /src
+COPY kafka-connect/pom.xml ./pom.xml
+# copy-dependencies writes every (transitive) runtime jar to target/plugin
+# (outputDirectory + scope are configured in the pom).
+RUN mvn -q -B dependency:copy-dependencies
+
+# ---- runtime ---------------------------------------------------------------
+# Confluent Platform 8.2.x ships Kafka 4.x clients, matching the apache/kafka
+# 4.0 broker. Pinned — keep it pinned and bump CP image + converter together.
+FROM confluentinc/cp-kafka-connect:8.2.1
+# Iceberg sink connector plugin: a directory of jars under a plugin.path entry
+# (/usr/share/java is on CONNECT_PLUGIN_PATH by default) = one Connect plugin.
+COPY --from=build /src/target/plugin /usr/share/java/iceberg-kafka-connect
+# Confluent JSON Schema converter (io.confluent.connect.json.JsonSchemaConverter);
+# installs under /usr/share/confluent-hub-components (also on plugin.path).
+RUN confluent-hub install --no-prompt confluentinc/kafka-connect-json-schema-converter:8.2.1

@@ -1,0 +1,70 @@
+# Kafka Connect worker (distributed mode, single worker) running the Apache
+# Iceberg sink connector — THIS IS THE INGEST PATH. The image
+# (s3-table-dump-connect:dev, built by
+# scripts/minikube-up.sh from Dockerfile.connect) adds the Iceberg connector
+# plugin + the Confluent JSON Schema converter to cp-kafka-connect.
+#
+# The connector itself is not configured here — it is registered against this
+# worker's REST API by the connector-setup Job (k8s/connector-setup.yaml).
+# Service name "kafka-connect" matches that Job's target.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-connect
+  namespace: s3-table-dump
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: kafka-connect }
+  template:
+    metadata:
+      labels: { app: kafka-connect }
+    spec:
+      containers:
+        - name: kafka-connect
+          image: s3-table-dump-connect:dev
+          imagePullPolicy: Never          # use the image built into minikube's docker
+          env:
+            - { name: CONNECT_BOOTSTRAP_SERVERS, value: "kafka:9092" }
+            - { name: CONNECT_GROUP_ID, value: "iceberg-connect-cluster" }
+            # Internal topics; RF 1 because the demo runs a single broker.
+            - { name: CONNECT_CONFIG_STORAGE_TOPIC, value: "connect-configs" }
+            - { name: CONNECT_OFFSET_STORAGE_TOPIC, value: "connect-offsets" }
+            - { name: CONNECT_STATUS_STORAGE_TOPIC, value: "connect-status" }
+            - { name: CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR, value: "1" }
+            - { name: CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR, value: "1" }
+            - { name: CONNECT_STATUS_STORAGE_REPLICATION_FACTOR, value: "1" }
+            # Worker-default converters. The Iceberg connector overrides
+            # value.converter to the JSON Schema converter per-connector
+            # (see connector-setup.yaml); keys are null/string here.
+            - { name: CONNECT_KEY_CONVERTER, value: "org.apache.kafka.connect.storage.StringConverter" }
+            - { name: CONNECT_VALUE_CONVERTER, value: "org.apache.kafka.connect.storage.StringConverter" }
+            # Single worker: advertise the pod IP for the (unused) inter-worker REST.
+            - name: CONNECT_REST_ADVERTISED_HOST_NAME
+              valueFrom:
+                fieldRef: { fieldPath: status.podIP }
+            - { name: CONNECT_REST_PORT, value: "8083" }
+            - { name: CONNECT_PLUGIN_PATH, value: "/usr/share/java,/usr/share/confluent-hub-components" }
+            # Bound the JVM so a Connect worker + S3 write buffers fit the
+            # tight single-node minikube.
+            - { name: KAFKA_HEAP_OPTS, value: "-Xms512m -Xmx512m" }
+          ports:
+            - { containerPort: 8083 }
+          readinessProbe:
+            httpGet: { path: /, port: 8083 }
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests: { memory: "640Mi", cpu: "250m" }
+            limits: { memory: "1280Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-connect
+  namespace: s3-table-dump
+spec:
+  selector: { app: kafka-connect }
+  ports:
+    - { port: 8083, targetPort: 8083 }
