@@ -13,7 +13,7 @@ public final class IcebergMaintenanceJob {
 
   public static void main(String[] args) throws Exception {
     IcebergCatalog catalog = IcebergCatalog.fromEnv();
-    catalog.awaitJdbc(30, Duration.ofSeconds(2));
+    catalog.awaitRest(30, Duration.ofSeconds(2));
 
     SparkSession spark = catalog.sparkSession("iceberg-maintenance");
     try {

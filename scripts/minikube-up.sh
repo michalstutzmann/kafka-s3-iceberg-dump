@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Bring up the whole demo on minikube: build the app image into minikube's
-# docker, deploy infra (Kafka, MinIO, Postgres, datagen), register the Kafka
-# Connect ingest sink, and install the Spark maintenance CronJobs. Idempotent
-# — safe to re-run.
+# docker, deploy infra (Kafka, MinIO, Postgres), bring up the Apache Polaris
+# REST catalog and create its `iceberg` catalog, register the Kafka Connect
+# ingest sink, and install the Spark maintenance CronJobs. Idempotent — safe to
+# re-run.
 #
 #   scripts/minikube-up.sh
 #
@@ -65,6 +66,17 @@ for d in postgres minio kafka; do
   kubectl -n "${NS}" rollout status deploy/"$d" --timeout=240s
 done
 
+echo "==> Iceberg catalog: Apache Polaris (REST) + bootstrap"
+# Polaris uses Postgres as its metastore (relational-jdbc); an admin-tool
+# initContainer seeds the POLARIS realm before the server starts.
+kubectl apply -f k8s/polaris.yaml
+kubectl -n "${NS}" rollout status deploy/polaris --timeout=300s
+# Create the `iceberg` catalog (MinIO storage), grant content access, and make
+# the `db` namespace. Recreate on re-run so config changes take effect.
+kubectl -n "${NS}" delete job polaris-setup --ignore-not-found
+kubectl apply -f k8s/polaris-setup.yaml
+kubectl -n "${NS}" wait --for=condition=complete job/polaris-setup --timeout=180s
+
 echo "==> ingest: schema registry + kafka connect (Iceberg sink)"
 kubectl apply -f k8s/schema-registry.yaml -f k8s/kafka-connect.yaml
 kubectl -n "${NS}" set image deployment/kafka-connect kafka-connect="${CONNECT_IMAGE}"
@@ -83,8 +95,8 @@ kubectl -n "${NS}" wait --for=condition=complete job/connector-setup --timeout=1
 echo "==> datagen (JSON Schema producer, phased v1 -> v2 evolution)"
 kubectl apply -f k8s/datagen.yaml
 
-echo "==> Spark maintenance CronJobs"
-kubectl apply -f k8s/maintenance-cron.yaml
+echo "==> Spark maintenance CronJobs (+ Lease RBAC)"
+kubectl apply -f k8s/maintenance-rbac.yaml -f k8s/maintenance-cron.yaml
 
 cat <<EOF
 
@@ -104,6 +116,14 @@ Cron schedules live in k8s/maintenance-cron.yaml.
   kubectl -n ${NS} get jobs   # one Job per cron firing
   # Force a maintenance run now:
   kubectl -n ${NS} create job --from=cronjob/maintenance-runner maintenance-now
+
+Iceberg catalog is Apache Polaris (REST):
+  kubectl -n ${NS} port-forward svc/polaris 8181:8181
+  TOKEN=\$(curl -s localhost:8181/api/catalog/v1/oauth/tokens \\
+    --user root:s3cr3t -H 'Polaris-Realm: POLARIS' \\
+    -d grant_type=client_credentials -d scope=PRINCIPAL_ROLE:ALL | jq -r .access_token)
+  curl -s -H "Authorization: Bearer \$TOKEN" -H 'Polaris-Realm: POLARIS' \\
+    localhost:8181/api/catalog/v1/iceberg/namespaces/db/tables | jq   # db.events present?
 
 Schema Registry / MinIO console:
   kubectl -n ${NS} port-forward svc/schema-registry 8081:8081    # JSON Schemas

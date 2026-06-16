@@ -1,6 +1,10 @@
-# Iceberg JDBC catalog + maintenance JdbcLockFactory store.
-# emptyDir (demo): catalog is recreated on restart. Service name "postgres"
-# matches IcebergCatalog.fromEnv()'s default jdbc:postgresql://postgres:5432.
+# Apache Polaris metastore (relational-jdbc persistence): holds the POLARIS
+# realm, principals, and the Iceberg catalog/table pointers. Polaris is the only
+# client of this database now — ingest and maintenance reach Iceberg through
+# Polaris over REST, not through a JDBC catalog. The `iceberg` database name is
+# kept for continuity; k8s/polaris.yaml points QUARKUS_DATASOURCE_JDBC_URL here.
+# emptyDir (demo): catalog metadata is recreated on restart (the admin-tool
+# bootstrap initContainer re-seeds the realm).
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -4,10 +4,11 @@
 #   - orphan-gc-runner: DeleteOrphanFiles
 #
 # The jobs are deliberately separate pods with independent memory/CPU budgets
-# and failure domains. Both Java mains take the same Postgres advisory lock
-# keyed by `db.events`, so an overlapping schedule serialises orphan removal
-# against rewrite/expire. Ingest writes do not use this lock; the Kafka Connect
-# sink relies on Iceberg's normal optimistic commit protocol.
+# and failure domains. Both Java mains take the same Kubernetes Lease
+# (`iceberg-maintenance`, see KubernetesLease.java + maintenance-rbac.yaml), so
+# an overlapping schedule serialises orphan removal against rewrite/expire
+# without any direct database access. Ingest writes do not use this lock; the
+# Kafka Connect sink relies on Iceberg's normal optimistic commit protocol.
 #
 # Tuning knobs:
 #   - schedule: when each batch runs.
@@ -33,6 +34,7 @@ spec:
       template:
         spec:
           restartPolicy: Never
+          serviceAccountName: maintenance
           containers:
             - name: spark
               image: s3-table-dump:dev
@@ -47,7 +49,13 @@ spec:
                 - "spark.driver.memory=768m"
                 - "/opt/spark/work-dir/app.jar"
               env:
-                - { name: S3_REGION, value: "us-east-1" }
+                # Lease holder identity + namespace for the maintenance lock.
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef: { fieldPath: metadata.name }
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef: { fieldPath: metadata.namespace }
               resources:
                 requests: { memory: "1024Mi", cpu: "500m" }
                 limits: { memory: "1536Mi" }
@@ -72,6 +80,7 @@ spec:
       template:
         spec:
           restartPolicy: Never
+          serviceAccountName: maintenance
           containers:
             - name: spark
               image: s3-table-dump:dev
@@ -86,7 +95,13 @@ spec:
                 - "spark.driver.memory=768m"
                 - "/opt/spark/work-dir/app.jar"
               env:
-                - { name: S3_REGION, value: "us-east-1" }
+                # Lease holder identity + namespace for the maintenance lock.
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef: { fieldPath: metadata.name }
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef: { fieldPath: metadata.namespace }
               resources:
                 requests: { memory: "1024Mi", cpu: "500m" }
                 limits: { memory: "1536Mi" }

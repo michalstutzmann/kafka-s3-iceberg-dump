@@ -6,8 +6,9 @@
 #   docker build -t s3-table-dump-connect:dev -f Dockerfile.connect .
 #
 # Two things the stock cp-kafka-connect image does not have, added here:
-#   1. The Iceberg sink connector + its deps (S3FileIO/AWS, Postgres JDBC
-#      driver, Hadoop) — assembled by kafka-connect/pom.xml. The connector's
+#   1. The Iceberg sink connector + its deps (S3FileIO/AWS, Hadoop) — assembled
+#      by kafka-connect/pom.xml. The connector talks to the Polaris REST catalog,
+#      so no JDBC driver is bundled. The connector's
 #      all-in-one distribution zip is built from Iceberg source (not on Maven
 #      Central), so we gather it from the published `iceberg-kafka-connect`
 #      artifact with Maven instead.

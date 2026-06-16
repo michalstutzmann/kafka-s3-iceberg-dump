@@ -1,0 +1,33 @@
+# RBAC for the Spark maintenance jobs' Kubernetes Lease lock (see
+# KubernetesLease.java). The two CronJob pods serialise themselves on a single
+# coordination.k8s.io/v1 Lease instead of a Postgres advisory lock, so they need
+# permission to read and write that Lease in this namespace — and nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maintenance
+  namespace: s3-table-dump
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maintenance-lease
+  namespace: s3-table-dump
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maintenance-lease
+  namespace: s3-table-dump
+subjects:
+  - kind: ServiceAccount
+    name: maintenance
+    namespace: s3-table-dump
+roleRef:
+  kind: Role
+  name: maintenance-lease
+  apiGroup: rbac.authorization.k8s.io
