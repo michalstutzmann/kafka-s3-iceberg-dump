@@ -66,6 +66,10 @@ final class IcebergCatalog {
     catalogProps.put("warehouse", warehouse);
     catalogProps.put("credential", credential);
     catalogProps.put("scope", scope);
+    // Be explicit about OAuth2 so the REST client does not infer it (and warn);
+    // the server URI also future-proofs against Iceberg removing the fallback.
+    catalogProps.put("rest.auth.type", "oauth2");
+    catalogProps.put("oauth2-server-uri", catalogUri + "/v1/oauth/tokens");
     // Ask Polaris to vend short-lived S3 access for each table load, so the
     // S3FileIO config (endpoint + credentials) comes from the catalog response.
     catalogProps.put("header.X-Iceberg-Access-Delegation", "vended-credentials");
