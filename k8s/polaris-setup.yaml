@@ -1,0 +1,90 @@
+# One-shot Job that provisions the Polaris catalog the rest of the demo uses.
+# Runs after the Polaris server is healthy (the admin-tool bootstrap in
+# k8s/polaris.yaml already created the POLARIS realm + root principal). Here we:
+#   1. obtain an OAuth2 token as root (client_credentials, scope PRINCIPAL_ROLE:ALL).
+#   2. create the INTERNAL catalog `iceberg` on MinIO/S3 storage, base location
+#      s3://warehouse — the same bucket the old JDBC catalog used.
+#   3. grant CATALOG_MANAGE_CONTENT to its catalog_admin role so root can
+#      read/write table content (create namespaces/tables, commit data).
+#   4. create the `db` namespace so the connector's auto-create only has to make
+#      the `events` table.
+#
+# Idempotent: re-running treats "already exists" (HTTP 409) as success, so a Job
+# restart or a re-deploy is safe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: polaris-setup
+  namespace: s3-table-dump
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup
+          image: alpine/curl:8.17.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              apk add --no-cache jq >/dev/null
+              POLARIS=http://polaris:8181
+              REALM=POLARIS
+
+              echo 'waiting for Polaris health...'
+              until curl -sf http://polaris:8182/q/health >/dev/null 2>&1; do sleep 2; done
+
+              echo 'obtaining root token...'
+              TOKEN=$(curl -sf "$POLARIS/api/catalog/v1/oauth/tokens" \
+                --user root:s3cr3t \
+                -H "Polaris-Realm: $REALM" \
+                -d grant_type=client_credentials \
+                -d scope=PRINCIPAL_ROLE:ALL | jq -r .access_token)
+              test -n "$TOKEN" && test "$TOKEN" != "null"
+
+              # POST $1 with body $2; treat 409 (already exists) as success.
+              post() {
+                code=$(curl -s -o /tmp/out -w '%{http_code}' \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -H "Polaris-Realm: $REALM" \
+                  -H 'Content-Type: application/json' \
+                  -X POST "$1" -d "$2")
+                echo "POST $1 -> $code"; cat /tmp/out; echo
+                [ "$code" = "200" ] || [ "$code" = "201" ] || [ "$code" = "409" ]
+              }
+
+              echo 'creating catalog iceberg...'
+              post "$POLARIS/api/management/v1/catalogs" '{
+                "catalog": {
+                  "name": "iceberg",
+                  "type": "INTERNAL",
+                  "readOnly": false,
+                  "properties": { "default-base-location": "s3://warehouse" },
+                  "storageConfigInfo": {
+                    "storageType": "S3",
+                    "allowedLocations": ["s3://warehouse/*"],
+                    "endpoint": "http://minio:9000",
+                    "endpointInternal": "http://minio:9000",
+                    "pathStyleAccess": true,
+                    "region": "us-east-1"
+                  }
+                }
+              }'
+
+              echo 'granting CATALOG_MANAGE_CONTENT to catalog_admin...'
+              curl -sf -H "Authorization: Bearer $TOKEN" \
+                -H "Polaris-Realm: $REALM" \
+                -H 'Content-Type: application/json' \
+                -X PUT \
+                "$POLARIS/api/management/v1/catalogs/iceberg/catalog-roles/catalog_admin/grants" \
+                -d '{"type":"catalog","privilege":"CATALOG_MANAGE_CONTENT"}'
+              echo
+
+              echo 'creating namespace db...'
+              post "$POLARIS/api/catalog/v1/iceberg/namespaces" '{"namespace":["db"]}'
+
+              echo 'polaris-setup complete'
+          resources:
+            requests: { memory: "32Mi", cpu: "20m" }
+            limits: { memory: "64Mi" }

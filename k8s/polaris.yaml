@@ -1,0 +1,105 @@
+# Apache Polaris — the Iceberg REST catalog. Both writers (the Kafka Connect
+# ingest sink and the two Spark maintenance jobs) talk to this server over the
+# Iceberg REST protocol at http://polaris:8181/api/catalog; nobody speaks to a
+# JDBC catalog anymore.
+#
+# Persistence is `relational-jdbc` on the shared Postgres (POLARIS realm metadata
+# + catalog/table pointers live there now, replacing the old Iceberg JDBC
+# catalog tables). Storage is MinIO via S3FileIO; Polaris owns the MinIO
+# credentials (AWS_* below) and vends them to clients, so neither Spark nor
+# Connect carries S3 keys.
+#
+# Bootstrap is a two-step init:
+#   1. wait-postgres  — block until Postgres accepts connections.
+#   2. bootstrap      — apache/polaris-admin-tool creates the relational-jdbc
+#                       schema + the POLARIS realm root principal (root/s3cr3t).
+#                       Idempotent, so a pod restart re-runs it harmlessly.
+# The catalog itself (name `iceberg`, namespace `db`) is created separately by
+# k8s/polaris-setup.yaml once this server is healthy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: polaris
+  namespace: s3-table-dump
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: polaris }
+  template:
+    metadata:
+      labels: { app: polaris }
+    spec:
+      initContainers:
+        - name: wait-postgres
+          image: postgres:17.10
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until pg_isready -h postgres -p 5432 -U iceberg -d iceberg; do
+                echo 'waiting for postgres...'; sleep 2;
+              done
+          resources:
+            requests: { memory: "16Mi", cpu: "10m" }
+            limits: { memory: "32Mi" }
+        - name: bootstrap
+          image: apache/polaris-admin-tool:1.5.0
+          args:
+            - "bootstrap"
+            - "--realm=POLARIS"
+            - "--credential=POLARIS,root,s3cr3t"
+          env:
+            - { name: POLARIS_PERSISTENCE_TYPE, value: "relational-jdbc" }
+            - { name: QUARKUS_DATASOURCE_JDBC_URL, value: "jdbc:postgresql://postgres:5432/iceberg" }
+            - { name: QUARKUS_DATASOURCE_USERNAME, value: "iceberg" }
+            - { name: QUARKUS_DATASOURCE_PASSWORD, value: "iceberg" }
+          resources:
+            requests: { memory: "256Mi", cpu: "100m" }
+            limits: { memory: "512Mi" }
+      containers:
+        - name: polaris
+          image: apache/polaris:1.5.0
+          env:
+            # --- persistence: shared Postgres as the Polaris metastore ---
+            - { name: POLARIS_PERSISTENCE_TYPE, value: "relational-jdbc" }
+            - { name: POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_RETRIES, value: "5" }
+            - { name: POLARIS_PERSISTENCE_RELATIONAL_JDBC_INITIAL_DELAY_IN_MS, value: "100" }
+            - { name: POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_DURATION_IN_MS, value: "5000" }
+            - { name: QUARKUS_DATASOURCE_JDBC_URL, value: "jdbc:postgresql://postgres:5432/iceberg" }
+            - { name: QUARKUS_DATASOURCE_USERNAME, value: "iceberg" }
+            - { name: QUARKUS_DATASOURCE_PASSWORD, value: "iceberg" }
+            # --- realm + root principal (matches the bootstrap step above) ---
+            - { name: POLARIS_REALM_CONTEXT_REALMS, value: "POLARIS" }
+            - { name: POLARIS_BOOTSTRAP_CREDENTIALS, value: "POLARIS,root,s3cr3t" }
+            - { name: POLARIS_READINESS_IGNORE_SEVERE_ISSUES, value: "true" }
+            - { name: QUARKUS_OTEL_SDK_DISABLED, value: "true" }
+            # --- MinIO credentials Polaris vends to clients (S3 storage) ---
+            - { name: AWS_REGION, value: "us-east-1" }
+            - { name: AWS_ACCESS_KEY_ID, value: "admin" }
+            - { name: AWS_SECRET_ACCESS_KEY, value: "password" }
+          ports:
+            - { name: api, containerPort: 8181 }
+            - { name: mgmt, containerPort: 8182 }
+          readinessProbe:
+            httpGet: { path: /q/health, port: 8182 }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /q/health/live, port: 8182 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests: { memory: "512Mi", cpu: "250m" }
+            limits: { memory: "1024Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: polaris
+  namespace: s3-table-dump
+spec:
+  selector: { app: polaris }
+  ports:
+    - { name: api, port: 8181, targetPort: 8181 }
+    - { name: mgmt, port: 8182, targetPort: 8182 }

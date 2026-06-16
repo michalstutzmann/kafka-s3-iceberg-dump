@@ -76,11 +76,21 @@
       <version>${hadoop.version}</version>
     </dependency>
 
-    <!-- Iceberg JDBC catalog + maintenance JdbcLockFactory talk to Postgres -->
+    <!-- Jackson for KubernetesLease's tiny REST client. Provided by the Spark
+         runtime image, so compile-only here (not bundled) to avoid clashing
+         with Spark's own Jackson. jackson-core is declared too: as a transitive
+         of a provided dep it is not put on the compile classpath automatically. -->
     <dependency>
-      <groupId>org.postgresql</groupId>
-      <artifactId>postgresql</artifactId>
-      <version>42.7.4</version>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.18.2</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+      <version>2.18.2</version>
+      <scope>provided</scope>
     </dependency>
   </dependencies>
 

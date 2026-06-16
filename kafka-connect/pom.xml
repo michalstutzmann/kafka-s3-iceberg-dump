@@ -3,8 +3,9 @@
   Build-only helper POM. It does NOT produce the app jar (that is the root
   pom.xml, the Spark maintenance jobs) and is NOT published anywhere — its sole
   job is to gather the Apache Iceberg Kafka Connect sink connector and the
-  dependencies it needs (S3FileIO/AWS, Postgres JDBC driver, Hadoop) into one
-  directory that becomes a Kafka Connect plugin (see Dockerfile.connect).
+  dependencies it needs (S3FileIO/AWS, Hadoop) into one directory that becomes
+  a Kafka Connect plugin (see Dockerfile.connect). The catalog is Polaris over
+  REST, so no JDBC driver is needed.
 
   The all-in-one connector distribution zip is built from Iceberg source and is
   not on Maven Central, but the `iceberg-kafka-connect` artifact IS, so we let
@@ -32,7 +33,6 @@
     <!-- keep in lockstep with ../pom.xml -->
     <iceberg.version>1.10.1</iceberg.version>
     <hadoop.version>3.4.1</hadoop.version>
-    <postgresql.version>42.7.4</postgresql.version>
   </properties>
 
   <dependencies>
@@ -75,14 +75,6 @@
       <groupId>org.apache.iceberg</groupId>
       <artifactId>iceberg-parquet</artifactId>
       <version>${iceberg.version}</version>
-    </dependency>
-
-    <!-- JDBC catalog driver: NOT included in the connector distribution
-         ("JDBC drivers are not included… you will need to include those"). -->
-    <dependency>
-      <groupId>org.postgresql</groupId>
-      <artifactId>postgresql</artifactId>
-      <version>${postgresql.version}</version>
     </dependency>
 
     <!-- Iceberg's catalog loading needs org.apache.hadoop.conf.Configuration on
