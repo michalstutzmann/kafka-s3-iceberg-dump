@@ -12,7 +12,11 @@
 # Usage:
 #   scripts/smoke-test.sh            # assume the stack is already up
 #   scripts/smoke-test.sh --up       # run scripts/minikube-up.sh first
+#   scripts/smoke-test.sh --keep-up  # do NOT stop minikube when finished
 #   SKIP_MAINTENANCE=1 scripts/smoke-test.sh   # skip the slow maintenance runs
+#
+# By default minikube is stopped on exit (pass or fail) to free resources; pass
+# --keep-up (or KEEP_MINIKUBE=1) to leave it running for iterative work.
 #
 # Exit code is non-zero if any check fails. Safe to re-run.
 set -uo pipefail
@@ -22,6 +26,9 @@ REALM=POLARIS
 CLIENT=root:s3cr3t
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
+
+DO_UP=0
+KEEP_MINIKUBE=${KEEP_MINIKUBE:-0}
 
 PASS=0
 FAIL=0
@@ -34,9 +41,21 @@ info()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
 pass()  { green "  PASS: $*"; PASS=$((PASS + 1)); }
 fail()  { red   "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 
+for arg in "$@"; do
+  case "$arg" in
+    --up) DO_UP=1 ;;
+    --keep-up) KEEP_MINIKUBE=1 ;;
+    *) red "unknown argument: $arg"; exit 2 ;;
+  esac
+done
+
 cleanup() {
   for pid in "${PF_PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   for j in "${TMP_JOBS[@]:-}"; do kubectl -n "$NS" delete job "$j" --ignore-not-found >/dev/null 2>&1 || true; done
+  if [ "$KEEP_MINIKUBE" != "1" ]; then
+    info "Stopping minikube (pass --keep-up to leave it running)"
+    minikube stop >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -82,7 +101,7 @@ records() {
 has_records() { local r; r=$(records); [ -n "$r" ] && [ "$r" != "0" ]; }
 
 # ---------------------------------------------------------------------------
-[ "${1:-}" = "--up" ] && { info "Bringing the stack up (scripts/minikube-up.sh)"; scripts/minikube-up.sh; }
+[ "$DO_UP" = "1" ] && { info "Bringing the stack up (scripts/minikube-up.sh)"; scripts/minikube-up.sh; }
 
 for bin in kubectl jq curl; do
   command -v "$bin" >/dev/null || { red "missing prerequisite: $bin"; exit 2; }
